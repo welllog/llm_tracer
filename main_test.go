@@ -1164,65 +1164,6 @@ func TestToolResultContinuationChaining(t *testing.T) {
 	}
 }
 
-func TestRepairSessionIDsFromRawRequest(t *testing.T) {
-	tempDir, err := os.MkdirTemp("", "llm_tracer_repair_*")
-	if err != nil {
-		t.Fatalf("failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tempDir)
-
-	dbPath := filepath.Join(tempDir, "repair.db")
-	dbMgr, err := InitDB(dbPath)
-	if err != nil {
-		t.Fatalf("failed to init db: %v", err)
-	}
-	defer dbMgr.Close()
-
-	rawRequest := `{"metadata":{"user_id":"{\"device_id\":\"abc\",\"session_id\":\"claude-session-123\"}"}}`
-	insert := func(sessionID string) int64 {
-		logID, err := dbMgr.InsertLog(&UnifiedLog{
-			Provider:    "anthropic",
-			Model:       "claude-test",
-			Path:        "/v1/messages",
-			StatusCode:  http.StatusOK,
-			Prompt:      []ChatMessage{{Role: "user", Content: "hello"}},
-			Response:    ChatMessage{Role: "assistant", Content: "ok"},
-			RawRequest:  rawRequest,
-			RawResponse: `{"ok":true}`,
-			SessionID:   sessionID,
-		})
-		if err != nil {
-			t.Fatalf("failed to insert log: %v", err)
-		}
-		return logID
-	}
-
-	firstID := insert("wrong-session-a")
-	secondID := insert("wrong-session-b")
-
-	repaired, err := dbMgr.RepairSessionIDsFromRawRequest()
-	if err != nil {
-		t.Fatalf("failed to repair session ids: %v", err)
-	}
-	if repaired != 2 {
-		t.Fatalf("expected 2 repaired rows, got %d", repaired)
-	}
-
-	assertSessionID := func(logID int64) {
-		var sessionID string
-		err := dbMgr.db.QueryRow(`SELECT COALESCE(session_id, '') FROM logs WHERE id = ?`, logID).Scan(&sessionID)
-		if err != nil {
-			t.Fatalf("failed to read session id for log %d: %v", logID, err)
-		}
-		if sessionID != "claude-session-123" {
-			t.Fatalf("expected repaired session id for log %d, got %q", logID, sessionID)
-		}
-	}
-
-	assertSessionID(firstID)
-	assertSessionID(secondID)
-}
-
 func TestResolveSessionWithAuthoritativeMetadata(t *testing.T) {
 	tempDir, err := os.MkdirTemp("", "llm_tracer_authoritative_*")
 	if err != nil {
@@ -1338,3 +1279,157 @@ func TestGetSessionLogs(t *testing.T) {
 		t.Errorf("unexpected logs order or contents: %+v", logs)
 	}
 }
+
+func TestDeleteLog(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "llm_tracer_delete_log_*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	dbPath := filepath.Join(tempDir, "delete_log.db")
+	dbMgr, err := InitDB(dbPath)
+	if err != nil {
+		t.Fatalf("failed to init db: %v", err)
+	}
+	defer dbMgr.Close()
+
+	// 插入一条带 handles 的 log
+	logID, err := dbMgr.InsertLog(&UnifiedLog{
+		Provider:   "openai",
+		Model:      "gpt-4",
+		Path:       "/v1/chat/completions",
+		StatusCode: 200,
+		Prompt:     []ChatMessage{{Role: "user", Content: "Hello"}},
+		Response:   ChatMessage{Role: "assistant", Content: "Hi"},
+		RequestHandles: []ConversationHandle{
+			{Kind: "thread_id", Value: "thread_abc"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to insert log: %v", err)
+	}
+
+	// 验证 log_handles 里是否已经有数据
+	var count int
+	err = dbMgr.db.QueryRow("SELECT COUNT(*) FROM log_handles WHERE log_id = ?", logID).Scan(&count)
+	if err != nil || count != 1 {
+		t.Fatalf("expected 1 log handle, got %d, err: %v", count, err)
+	}
+
+	// 执行删除
+	err = dbMgr.DeleteLog(logID)
+	if err != nil {
+		t.Fatalf("failed to delete log: %v", err)
+	}
+
+	// 确认 logs 里找不到了
+	var logCount int
+	err = dbMgr.db.QueryRow("SELECT COUNT(*) FROM logs WHERE id = ?", logID).Scan(&logCount)
+	if err != nil || logCount != 0 {
+		t.Fatalf("expected log to be deleted, count: %d, err: %v", logCount, err)
+	}
+
+	// 确认 log_handles 里的也被级联删除了
+	err = dbMgr.db.QueryRow("SELECT COUNT(*) FROM log_handles WHERE log_id = ?", logID).Scan(&count)
+	if err != nil || count != 0 {
+		t.Fatalf("expected log handle to be deleted, count: %d, err: %v", count, err)
+	}
+}
+
+func TestDeleteSessionLogs(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "llm_tracer_delete_session_*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	dbPath := filepath.Join(tempDir, "delete_session.db")
+	dbMgr, err := InitDB(dbPath)
+	if err != nil {
+		t.Fatalf("failed to init db: %v", err)
+	}
+	defer dbMgr.Close()
+
+	sessionID1 := "session-1"
+	sessionID2 := "session-2"
+
+	// session 1 插入 2 条
+	id1, _ := dbMgr.InsertLog(&UnifiedLog{
+		Provider:   "openai",
+		Model:      "gpt-4",
+		Path:       "/v1/chat/completions",
+		StatusCode: 200,
+		SessionID:  sessionID1,
+		Prompt:     []ChatMessage{{Role: "user", Content: "Hello 1"}},
+		Response:   ChatMessage{Role: "assistant", Content: "Hi 1"},
+		RequestHandles: []ConversationHandle{
+			{Kind: "thread_id", Value: "thread_1"},
+		},
+	})
+	id2, _ := dbMgr.InsertLog(&UnifiedLog{
+		Provider:   "openai",
+		Model:      "gpt-4",
+		Path:       "/v1/chat/completions",
+		StatusCode: 200,
+		SessionID:  sessionID1,
+		Prompt:     []ChatMessage{{Role: "user", Content: "Hello 2"}},
+		Response:   ChatMessage{Role: "assistant", Content: "Hi 2"},
+	})
+
+	// session 2 插入 1 条
+	id3, _ := dbMgr.InsertLog(&UnifiedLog{
+		Provider:   "openai",
+		Model:      "gpt-4",
+		Path:       "/v1/chat/completions",
+		StatusCode: 200,
+		SessionID:  sessionID2,
+		Prompt:     []ChatMessage{{Role: "user", Content: "Hello 3"}},
+		Response:   ChatMessage{Role: "assistant", Content: "Hi 3"},
+		RequestHandles: []ConversationHandle{
+			{Kind: "thread_id", Value: "thread_2"},
+		},
+	})
+
+	// 确认 session 1 有 2 条 logs
+	logs, _ := dbMgr.GetSessionLogs(sessionID1)
+	if len(logs) != 2 {
+		t.Fatalf("expected 2 logs for session 1, got %d", len(logs))
+	}
+
+	// 确认 session 1 对应的 handles 存在
+	var count int
+	_ = dbMgr.db.QueryRow("SELECT COUNT(*) FROM log_handles WHERE log_id = ?", id1).Scan(&count)
+	if count != 1 {
+		t.Fatalf("expected 1 handle for id1, got %d", count)
+	}
+
+	// 删除 session 1
+	err = dbMgr.DeleteSessionLogs(sessionID1)
+	if err != nil {
+		t.Fatalf("failed to delete session logs: %v", err)
+	}
+
+	// 确认 session 1 logs 已经没有了
+	logs, _ = dbMgr.GetSessionLogs(sessionID1)
+	if len(logs) != 0 {
+		t.Fatalf("expected 0 logs for session 1, got %d", len(logs))
+	}
+
+	// 确认 session 1 logs 对应的 handles 也没了
+	_ = dbMgr.db.QueryRow("SELECT COUNT(*) FROM log_handles WHERE log_id IN (?, ?)", id1, id2).Scan(&count)
+	if count != 0 {
+		t.Fatalf("expected 0 handles for deleted session, got %d", count)
+	}
+
+	// 确认 session 2 logs 和 handles 仍然存在
+	logs2, _ := dbMgr.GetSessionLogs(sessionID2)
+	if len(logs2) != 1 {
+		t.Fatalf("expected 1 log for session 2, got %d", len(logs2))
+	}
+	_ = dbMgr.db.QueryRow("SELECT COUNT(*) FROM log_handles WHERE log_id = ?", id3).Scan(&count)
+	if count != 1 {
+		t.Fatalf("expected 1 handle for id3, got %d", count)
+	}
+}
+

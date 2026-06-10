@@ -135,7 +135,9 @@ func (mgr *DBManager) createTables() error {
 		error_message TEXT,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		session_id TEXT,
-		client_fingerprint TEXT
+		client_fingerprint TEXT,
+		parent_id INTEGER,
+		parent_tool_call_id TEXT
 	);
 	CREATE INDEX IF NOT EXISTS idx_logs_created_at ON logs(created_at DESC);
 	CREATE INDEX IF NOT EXISTS idx_logs_provider ON logs(provider);
@@ -153,15 +155,6 @@ func (mgr *DBManager) createTables() error {
 	if err != nil {
 		return err
 	}
-
-	// 兼容旧表升级：如果 logs 表中还没有 session_id 列，尝试添加
-	_, _ = mgr.db.Exec("ALTER TABLE logs ADD COLUMN session_id TEXT;")
-	_, _ = mgr.db.Exec("ALTER TABLE logs ADD COLUMN cached_tokens INTEGER DEFAULT 0;")
-	_, _ = mgr.db.Exec("ALTER TABLE logs ADD COLUMN cache_read_tokens INTEGER DEFAULT 0;")
-	_, _ = mgr.db.Exec("ALTER TABLE logs ADD COLUMN cache_creation_tokens INTEGER DEFAULT 0;")
-	_, _ = mgr.db.Exec("ALTER TABLE logs ADD COLUMN parent_id INTEGER;")
-	_, _ = mgr.db.Exec("ALTER TABLE logs ADD COLUMN parent_tool_call_id TEXT;")
-	_, _ = mgr.db.Exec("ALTER TABLE logs ADD COLUMN client_fingerprint TEXT;")
 
 	// 确保 session_id 列存在后，再创建其索引
 	_, err = mgr.db.Exec("CREATE INDEX IF NOT EXISTS idx_logs_session_id ON logs(session_id);")
@@ -962,125 +955,56 @@ func (mgr *DBManager) GetLatestLogIDBySession(sessionID string) (*int64, error) 
 	return &id, nil
 }
 
-func (mgr *DBManager) RepairSessionIDsFromRawRequest() (int64, error) {
-	rows, err := mgr.db.Query(`
-		SELECT id, COALESCE(session_id, ''), COALESCE(raw_request, '')
-		FROM logs
-		ORDER BY id ASC
-	`)
+
+
+func (mgr *DBManager) DeleteLog(id int64) error {
+	tx, err := mgr.db.Begin()
 	if err != nil {
-		return 0, err
+		return err
 	}
-	defer rows.Close()
+	defer tx.Rollback()
 
-	type repairCandidate struct {
-		id               int64
-		currentSessionID string
-		rawRequest       string
+	// 1. 删除 log_handles 中关联的记录
+	_, err = tx.Exec("DELETE FROM log_handles WHERE log_id = ?", id)
+	if err != nil {
+		return fmt.Errorf("delete log handles: %w", err)
 	}
 
-	var candidates []repairCandidate
-	for rows.Next() {
-		var candidate repairCandidate
-		if err := rows.Scan(&candidate.id, &candidate.currentSessionID, &candidate.rawRequest); err != nil {
-			return 0, err
-		}
-		candidates = append(candidates, candidate)
+	// 2. 删除 logs 表中的记录
+	_, err = tx.Exec("DELETE FROM logs WHERE id = ?", id)
+	if err != nil {
+		return fmt.Errorf("delete log: %w", err)
+	}
+
+	return tx.Commit()
+}
+
+func (mgr *DBManager) DeleteSessionLogs(sessionID string) error {
+	if sessionID == "" {
+		return nil
 	}
 
 	tx, err := mgr.db.Begin()
 	if err != nil {
-		return 0, err
+		return err
 	}
 	defer tx.Rollback()
 
-	stmt, err := tx.Prepare(`UPDATE logs SET session_id = ? WHERE id = ?`)
+	// 1. 删除 log_handles 中所有属于该会话 logs 的记录
+	_, err = tx.Exec(`
+		DELETE FROM log_handles 
+		WHERE log_id IN (SELECT id FROM logs WHERE session_id = ?)
+	`, sessionID)
 	if err != nil {
-		return 0, err
-	}
-	defer stmt.Close()
-
-	var updated int64
-	for _, candidate := range candidates {
-		if candidate.rawRequest == "" {
-			continue
-		}
-		sessionID := ExtractRequestSessionID([]byte(candidate.rawRequest))
-		if sessionID == "" || sessionID == candidate.currentSessionID {
-			continue
-		}
-		if _, err := stmt.Exec(sessionID, candidate.id); err != nil {
-			return updated, err
-		}
-		updated++
+		return fmt.Errorf("delete session log handles: %w", err)
 	}
 
-	if err := tx.Commit(); err != nil {
-		return updated, err
+	// 2. 删除 logs 表中该会话的记录
+	_, err = tx.Exec("DELETE FROM logs WHERE session_id = ?", sessionID)
+	if err != nil {
+		return fmt.Errorf("delete session logs: %w", err)
 	}
-	return updated, nil
+
+	return tx.Commit()
 }
 
-func (mgr *DBManager) RepairConversationHandlesFromLogs() (int64, error) {
-	rows, err := mgr.db.Query(`
-		SELECT id, COALESCE(raw_request, ''), COALESCE(raw_response, '')
-		FROM logs
-		ORDER BY id ASC
-	`)
-	if err != nil {
-		return 0, err
-	}
-	defer rows.Close()
-
-	tx, err := mgr.db.Begin()
-	if err != nil {
-		return 0, err
-	}
-	defer tx.Rollback()
-
-	var inserted int64
-	for rows.Next() {
-		var logID int64
-		var rawRequest, rawResponse string
-		if err := rows.Scan(&logID, &rawRequest, &rawResponse); err != nil {
-			return inserted, err
-		}
-		before := inserted
-		if rawRequest != "" {
-			for _, handle := range compactHandles(ExtractConversationHandles([]byte(rawRequest))) {
-				res, err := tx.Exec(`
-					INSERT OR IGNORE INTO log_handles (log_id, source, handle_kind, handle_value)
-					VALUES (?, 'request', ?, ?)
-				`, logID, handle.Kind, handle.Value)
-				if err != nil {
-					return inserted, err
-				}
-				if affected, err := res.RowsAffected(); err == nil {
-					inserted += affected
-				}
-			}
-		}
-		if rawResponse != "" {
-			for _, handle := range compactHandles(ExtractResponseHandles([]byte(rawResponse))) {
-				res, err := tx.Exec(`
-					INSERT OR IGNORE INTO log_handles (log_id, source, handle_kind, handle_value)
-					VALUES (?, 'response', ?, ?)
-				`, logID, handle.Kind, handle.Value)
-				if err != nil {
-					return inserted, err
-				}
-				if affected, err := res.RowsAffected(); err == nil {
-					inserted += affected
-				}
-			}
-		}
-		if inserted < before {
-			inserted = before
-		}
-	}
-
-	if err := tx.Commit(); err != nil {
-		return inserted, err
-	}
-	return inserted, nil
-}

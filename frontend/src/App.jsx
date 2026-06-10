@@ -262,6 +262,25 @@ const IconEyeOff = () => (
   </svg>
 );
 
+const IconTrash = () => (
+  <svg
+    xmlns="http://www.w3.org/2000/svg"
+    width="14"
+    height="14"
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="2"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+  >
+    <polyline points="3 6 5 6 21 6" />
+    <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+    <line x1="10" y1="11" x2="10" y2="17" />
+    <line x1="14" y1="11" x2="14" y2="17" />
+  </svg>
+);
+
 // 智能模拟后端的路由路径拼接（进行去重处理）
 function joinUpstreamURL(baseURL, pathSuffix) {
   if (!baseURL) return "";
@@ -413,6 +432,7 @@ export default function App() {
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [showOpenAIKey, setShowOpenAIKey] = useState(false);
   const [showAnthropicKey, setShowAnthropicKey] = useState(false);
+  const [showResponsesKey, setShowResponsesKey] = useState(false);
   const [isConfigSaving, setIsConfigSaving] = useState(false);
   const [copiedText, setCopiedText] = useState("");
   const [activeTab, setActiveTab] = useState("trace"); // trace, prompt, raw_req, raw_resp
@@ -645,6 +665,62 @@ export default function App() {
       setIsLogLoading(false);
     }
   }, [fetchSessionLogs]);
+
+  // 删除单个日志
+  const handleDeleteLog = async (e, id) => {
+    e.stopPropagation(); // 阻止卡片点击展开详情
+    if (!window.confirm("确定要删除这条请求日志吗？该操作不可逆。")) {
+      return;
+    }
+
+    try {
+      const res = await fetch(`/api/logs/${id}`, {
+        method: "DELETE",
+      });
+      if (res.ok) {
+        // 如果当前选中的是正在被删除的日志，重置选中状态
+        if (selectedLogId === id) {
+          setSelectedLogId(null);
+        }
+        // 重新获取日志列表与用量统计
+        fetchLogs(currentPage);
+        fetchStats();
+      } else {
+        alert("删除请求日志失败");
+      }
+    } catch (err) {
+      console.error("Failed to delete log:", err);
+      alert("删除发生异常");
+    }
+  };
+
+  // 删除整个会话的所有请求日志
+  const handleDeleteSessionLogs = async (sessionId) => {
+    if (!sessionId) return;
+    if (!window.confirm(`确定要删除会话 (ID: ${sessionId}) 中的所有请求日志吗？该操作不可逆。`)) {
+      return;
+    }
+
+    try {
+      const res = await fetch(`/api/sessions/${sessionId}/logs`, {
+        method: "DELETE",
+      });
+      if (res.ok) {
+        // 如果当前选中的日志属于此会话，重置选中状态
+        if (selectedLog && selectedLog.sessionId === sessionId) {
+          setSelectedLogId(null);
+        }
+        // 重新获取日志列表与用量统计
+        fetchLogs(currentPage);
+        fetchStats();
+      } else {
+        alert("删除会话日志失败");
+      }
+    } catch (err) {
+      console.error("Failed to delete session logs:", err);
+      alert("删除发生异常");
+    }
+  };
 
   // 保存配置
   const handleSaveConfig = async (e) => {
@@ -1420,7 +1496,7 @@ export default function App() {
           e.stopPropagation();
           setSelectedLogId(log.id);
         }}
-        className={`pl-3 pr-4 py-3.5 rounded-xl cursor-pointer border transition-all flex flex-col gap-2 my-2.5 ${
+        className={`pl-3 pr-4 py-3.5 rounded-xl cursor-pointer border transition-all flex flex-col gap-2 my-2.5 group ${
           isBranch
             ? "ml-4 bg-slate-900/35 border-amber-900/30"
             : "bg-slate-950/25 border-slate-900/80 hover:bg-slate-900/40 hover:border-slate-800/80"
@@ -1444,9 +1520,18 @@ export default function App() {
               {log.sessionId ? `会话 #${log.sessionSeq}` : `#${log.id}`}
             </span>
           </div>
-          <span className="text-[9px] text-slate-400/80 code-font">
-            {log.createdAt ? log.createdAt.split(" ")[1] : ""}
-          </span>
+          <div className="flex items-center gap-2 shrink-0">
+            <span className="text-[9px] text-slate-400/80 code-font group-hover:hidden">
+              {log.createdAt ? log.createdAt.split(" ")[1] : ""}
+            </span>
+            <button
+              title="删除请求"
+              onClick={(e) => handleDeleteLog(e, log.id)}
+              className="hidden group-hover:flex items-center justify-center p-1 text-slate-500 hover:text-red-400 rounded hover:bg-slate-900 transition-colors"
+            >
+              <IconTrash />
+            </button>
+          </div>
         </div>
 
         <div className="text-[11px] font-semibold text-slate-200 truncate font-mono">
@@ -2179,8 +2264,18 @@ export default function App() {
                 {activeTab === "session" && selectedLog.sessionId && (
                   <div className="flex flex-col gap-5 select-none font-sans">
                     <div className="text-[10px] text-slate-400 font-bold uppercase tracking-wider mb-1 flex justify-between items-center bg-slate-950/20 px-4 py-2 border border-slate-900/50 rounded-xl">
-                      <span>🔗 会话轮次目录 / 点击可快速定位详情</span>
-                      <span className="font-mono text-cyan-400">共 {sessionLogs.length} 轮对话</span>
+                      <div className="flex items-center gap-2">
+                        <span>🔗 会话轮次目录 / 点击可快速定位详情</span>
+                        <span className="font-mono text-cyan-400">({sessionLogs.length} 轮对话)</span>
+                      </div>
+                      <button
+                        onClick={() => handleDeleteSessionLogs(selectedLog.sessionId)}
+                        className="flex items-center gap-1 text-[10px] font-bold text-red-400 hover:text-red-300 px-2.5 py-1 rounded-lg bg-red-950/20 hover:bg-red-950/40 border border-red-900/30 transition-all active:scale-95 cursor-pointer"
+                        title="删除该会话所有请求日志"
+                      >
+                        <IconTrash />
+                        <span>删除会话所有请求</span>
+                      </button>
                     </div>
 
                     {isSessionLoading ? (
@@ -2483,6 +2578,101 @@ export default function App() {
                       </button>
                     </div>
                   </div>
+                  {/* 实时本地代理 URL 展示 */}
+                  <div className="mt-1 px-3 py-2.5 bg-slate-950/40 border border-slate-900/60 rounded-xl flex flex-col gap-1 text-[10px] font-mono">
+                    <div className="text-[9px] text-slate-500 uppercase font-bold tracking-wider font-sans mb-0.5">
+                      OpenAI 本地代理客户端配置
+                    </div>
+                    <div className="flex justify-between gap-2">
+                      <span className="text-slate-500">Base URL:</span>
+                      <span className="text-cyan-400/90 select-all break-all">
+                        {proxyBase}/v1
+                      </span>
+                    </div>
+                    <div className="flex justify-between gap-2 mt-0.5">
+                      <span className="text-slate-500">Chat URL:</span>
+                      <span className="text-cyan-400/90 select-all break-all">
+                        {proxyBase}/v1/chat/completions
+                      </span>
+                    </div>
+                    <div className="flex justify-between gap-2 mt-0.5">
+                      <span className="text-slate-500">Responses:</span>
+                      <span className="text-cyan-400/90 select-all break-all">
+                        {proxyBase}/v1/responses
+                      </span>
+                    </div>
+
+                    <div className="border-t border-slate-900/40 my-1.5 pt-1.5" />
+
+                    <div className="text-[9px] text-slate-500 uppercase font-bold tracking-wider font-sans mb-0.5">
+                      实际发往上游 API 校验
+                    </div>
+                    <div className="flex justify-between gap-2">
+                      <span className="text-slate-500">Chat URL:</span>
+                      <span className="text-emerald-400/90 break-all">
+                        {joinUpstreamURL(
+                          config.openaiBaseURL,
+                          "/v1/chat/completions",
+                        ) || "(未配置上游地址)"}
+                      </span>
+                    </div>
+                    <div className="flex justify-between gap-2 mt-0.5">
+                      <span className="text-slate-500">Responses:</span>
+                      <span className="text-emerald-400/90 break-all">
+                        {joinUpstreamURL(
+                          config.openaiResponsesBaseURL || config.openaiBaseURL,
+                          "/v1/responses",
+                        ) || "(未配置上游地址)"}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="border-t border-slate-900/60 pt-4 flex flex-col gap-3">
+                  <span className="text-xs font-bold text-cyan-400 tracking-wide uppercase flex items-center gap-1.5">
+                    <span>OpenAI Responses Upstream 路由 (可选)</span>
+                    <span className="px-1.5 py-0.2 rounded bg-slate-900 text-[8px] text-slate-400 border border-slate-800">可选</span>
+                  </span>
+                  <p className="text-[10px] text-slate-400 leading-relaxed -mt-1 font-sans">
+                    用于单独配置 OpenAI GPT-4o Realtime / Responses 接口的上游地址。若留空，则自动回退至上方的 OpenAI Upstream 配置。
+                  </p>
+                  <div className="flex flex-col gap-1.5">
+                    <label className="text-[10px] text-slate-550 font-bold">
+                      上游 Base URL
+                    </label>
+                    <input
+                      type="text"
+                      value={config.openaiResponsesBaseURL}
+                      onChange={(e) =>
+                        setConfig({ ...config, openaiResponsesBaseURL: e.target.value })
+                      }
+                      className="bg-slate-950/50 border border-slate-900 rounded-xl px-3.5 py-2.5 text-xs outline-none focus:border-cyan-500/50 focus:bg-slate-950/85 focus:shadow-[0_0_10px_rgba(6,182,212,0.15)] text-slate-200 transition-all font-mono"
+                      placeholder="https://api.openai.com"
+                    />
+                  </div>
+                  <div className="flex flex-col gap-1.5">
+                    <label className="text-[10px] text-slate-550 font-bold">
+                      API Key
+                    </label>
+                    <div className="relative flex items-center">
+                      <input
+                        type={showResponsesKey ? "text" : "password"}
+                        value={config.openaiResponsesAPIKey}
+                        onChange={(e) =>
+                          setConfig({ ...config, openaiResponsesAPIKey: e.target.value })
+                        }
+                        className="w-full bg-slate-950/50 border border-slate-900 rounded-xl pl-3.5 pr-10 py-2.5 text-xs outline-none focus:border-cyan-500/50 focus:bg-slate-950/85 focus:shadow-[0_0_10px_rgba(6,182,212,0.15)] text-slate-200 transition-all font-mono"
+                        placeholder="sk-..."
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setShowResponsesKey(!showResponsesKey)}
+                        className="absolute right-3 text-slate-400 hover:text-slate-200 transition-colors focus:outline-none flex items-center justify-center"
+                      >
+                        {showResponsesKey ? <IconEyeOff /> : <IconEye />}
+                      </button>
+                    </div>
+                  </div>
                 </div>
 
                 <div className="border-t border-slate-900/60 pt-4 flex flex-col gap-3">
@@ -2524,6 +2714,39 @@ export default function App() {
                       >
                         {showAnthropicKey ? <IconEyeOff /> : <IconEye />}
                       </button>
+                    </div>
+                  </div>
+                  {/* 实时本地代理 URL 展示 */}
+                  <div className="mt-1 px-3 py-2.5 bg-slate-950/40 border border-slate-900/60 rounded-xl flex flex-col gap-1 text-[10px] font-mono">
+                    <div className="text-[9px] text-slate-500 uppercase font-bold tracking-wider font-sans mb-0.5">
+                      Anthropic 本地代理客户端配置
+                    </div>
+                    <div className="flex justify-between gap-2">
+                      <span className="text-slate-500">Base URL:</span>
+                      <span className="text-purple-400/90 select-all break-all">
+                        {proxyBase}/v1
+                      </span>
+                    </div>
+                    <div className="flex justify-between gap-2 mt-0.5">
+                      <span className="text-slate-500">Messages:</span>
+                      <span className="text-purple-400/90 select-all break-all">
+                        {proxyBase}/v1/messages
+                      </span>
+                    </div>
+
+                    <div className="border-t border-slate-900/40 my-1.5 pt-1.5" />
+
+                    <div className="text-[9px] text-slate-500 uppercase font-bold tracking-wider font-sans mb-0.5">
+                      实际发往上游 API 校验
+                    </div>
+                    <div className="flex justify-between gap-2">
+                      <span className="text-slate-500">Messages:</span>
+                      <span className="text-emerald-400/90 break-all">
+                        {joinUpstreamURL(
+                          config.anthropicBaseURL,
+                          "/v1/messages",
+                        ) || "(未配置上游地址)"}
+                      </span>
                     </div>
                   </div>
                 </div>

@@ -504,17 +504,6 @@ func main() {
 	}
 	server.db = dbMgr
 
-	if repaired, err := dbMgr.RepairSessionIDsFromRawRequest(); err != nil {
-		log.Printf("failed to repair session ids from request metadata: %v", err)
-	} else if repaired > 0 {
-		log.Printf("repaired %d log session ids from request metadata", repaired)
-	}
-	if repairedHandles, err := dbMgr.RepairConversationHandlesFromLogs(); err != nil {
-		log.Printf("failed to repair conversation handles from logs: %v", err)
-	} else if repairedHandles > 0 {
-		log.Printf("repaired %d conversation handles from historical logs", repairedHandles)
-	}
-
 	// 1. 启动代理服务
 	if err := server.startProxyService(); err != nil {
 		log.Fatalf("failed to start proxy service: %v", err)
@@ -528,6 +517,8 @@ func main() {
 	consoleMux.HandleFunc("GET /api/logs/{id}", server.handleGetLogDetail)
 	consoleMux.HandleFunc("GET /api/sessions/{id}/logs", server.handleGetSessionLogs)
 	consoleMux.HandleFunc("GET /api/stats", server.handleGetStats)
+	consoleMux.HandleFunc("DELETE /api/logs/{id}", server.handleDeleteLog)
+	consoleMux.HandleFunc("DELETE /api/sessions/{id}/logs", server.handleDeleteSessionLogs)
 
 	// 静态前端路由
 	var staticHandler http.Handler
@@ -711,6 +702,41 @@ func (s *ProxyServer) handleGetStats(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(stats)
+}
+
+func (s *ProxyServer) handleDeleteLog(w http.ResponseWriter, r *http.Request) {
+	idStr := r.PathValue("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		http.Error(w, "invalid log id", http.StatusBadRequest)
+		return
+	}
+
+	if err := s.db.DeleteLog(id); err != nil {
+		http.Error(w, fmt.Sprintf("delete log: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`{"status":"ok"}`))
+}
+
+func (s *ProxyServer) handleDeleteSessionLogs(w http.ResponseWriter, r *http.Request) {
+	sessionID := r.PathValue("id")
+	if sessionID == "" {
+		http.Error(w, "missing session id", http.StatusBadRequest)
+		return
+	}
+
+	if err := s.db.DeleteSessionLogs(sessionID); err != nil {
+		http.Error(w, fmt.Sprintf("delete session logs: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`{"status":"ok"}`))
 }
 
 // ==========================================
