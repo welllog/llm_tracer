@@ -39,3 +39,9 @@ dist/
 implementation_plan.md
 task.md
 walkthrough.md
+
+# macOS App Bundles and packaging cache
+LLMTracer.app/
+*.app/
+*.icns
+*.iconset/

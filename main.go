@@ -12,18 +12,26 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"image"
+	"image/color"
+	"image/draw"
+	"image/png"
 	"io"
 	"io/fs"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 	"unicode"
+
+	"github.com/getlantern/systray"
 )
 
 //go:embed static/*
@@ -146,17 +154,19 @@ func (s *ProxyServer) loadConfig() error {
 	s.configLock.Lock()
 	defer s.configLock.Unlock()
 
+	appDir := getAppDir()
+
 	// 1. 设置默认值
 	s.config = AppConfig{
 		ListenAddr:             ":1238",
 		OpenaiBaseURL:          "https://api.openai.com",
 		OpenaiResponsesBaseURL: "https://api.openai.com",
 		AnthropicBaseURL:       "https://api.anthropic.com",
-		DBPath:                 "./data/llm_tracer.db",
+		DBPath:                 filepath.Join(appDir, "llm_tracer.db"),
 	}
 
 	// 2. 从文件读取
-	configPath := "config.json"
+	configPath := filepath.Join(appDir, "config.json")
 	data, err := os.ReadFile(configPath)
 	if err == nil {
 		var fileCfg AppConfig
@@ -227,7 +237,9 @@ func (s *ProxyServer) saveConfig(newCfg AppConfig) error {
 		return err
 	}
 
-	return os.WriteFile("config.json", data, 0644)
+	appDir := getAppDir()
+	configPath := filepath.Join(appDir, "config.json")
+	return os.WriteFile(configPath, data, 0644)
 }
 
 func (s *ProxyServer) startProxyServiceLocked() error {
@@ -300,6 +312,139 @@ func (s *ProxyServer) restartProxyService() error {
 	return s.startProxyServiceLocked()
 }
 
+var (
+	globalServer     *ProxyServer
+	globalConsoleURL string
+	consoleListener  net.Listener
+	consoleSrv       *http.Server
+)
+
+// 获取配置和数据库隐藏目录 ~/.llm_tracer
+func getAppDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "."
+	}
+	dir := filepath.Join(home, ".llm_tracer")
+	_ = os.MkdirAll(dir, 0755)
+	return dir
+}
+
+// 探测并分配空闲端口
+func findFreePort(addr string) (string, error) {
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		if strings.HasPrefix(addr, ":") {
+			portStr = addr[1:]
+			host = ""
+		} else {
+			return addr, err
+		}
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return addr, err
+	}
+
+	for i := 0; i < 100; i++ {
+		testPort := port + i
+		testAddr := net.JoinHostPort(host, strconv.Itoa(testPort))
+		ln, err := net.Listen("tcp", testAddr)
+		if err == nil {
+			ln.Close()
+			return testAddr, nil
+		}
+	}
+	return addr, fmt.Errorf("no free port found starting from %d", port)
+}
+
+// 跨平台打开默认浏览器
+func openBrowser(url string) error {
+	var cmd string
+	var args []string
+	switch runtime.GOOS {
+	case "windows":
+		cmd = "cmd"
+		args = []string{"/c", "start", url}
+	case "darwin":
+		cmd = "open"
+		args = []string{url}
+	default: // "linux", "freebsd", etc.
+		cmd = "xdg-open"
+		args = []string{url}
+	}
+	return exec.Command(cmd, args...).Start()
+}
+
+// 生成系统托盘的默认图标 (16x16 PNG)
+func generateDefaultIcon() []byte {
+	img := image.NewRGBA(image.Rect(0, 0, 16, 16))
+	// 填充背景：深灰色
+	bg := color.RGBA{40, 44, 52, 255}
+	draw.Draw(img, img.Bounds(), &image.Uniform{bg}, image.Point{}, draw.Src)
+	// 在中间画一个绿色的小方块（代表服务正常）
+	green := color.RGBA{16, 185, 129, 255} // Emerald 500
+	for x := 5; x <= 10; x++ {
+		for y := 5; y <= 10; y++ {
+			img.Set(x, y, green)
+		}
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		return nil
+	}
+	return buf.Bytes()
+}
+
+func onReady() {
+	icon := generateDefaultIcon()
+	if icon != nil {
+		systray.SetIcon(icon)
+	}
+	systray.SetTitle("LLM Tracer")
+	systray.SetTooltip("LLM Tracer Proxy & Recorder")
+
+	mOpen := systray.AddMenuItem("打开控制台", "打开 LLM Tracer 控制台页面")
+	mRestart := systray.AddMenuItem("重启代理服务", "重启底层 LLM 代理拦截服务")
+	systray.AddSeparator()
+	mQuit := systray.AddMenuItem("退出", "关闭服务并退出")
+
+	// 自动打开默认浏览器
+	go func() {
+		time.Sleep(500 * time.Millisecond) // 等待监听就绪
+		_ = openBrowser(globalConsoleURL)
+	}()
+
+	go func() {
+		for {
+			select {
+			case <-mOpen.ClickedCh:
+				_ = openBrowser(globalConsoleURL)
+			case <-mRestart.ClickedCh:
+				log.Println("Restarting proxy service from tray...")
+				if err := globalServer.restartProxyService(); err != nil {
+					log.Printf("Failed to restart proxy service: %v", err)
+				}
+			case <-mQuit.ClickedCh:
+				systray.Quit()
+			}
+		}
+	}()
+}
+
+func onExit() {
+	log.Println("Stopping services and exiting...")
+	if consoleSrv != nil {
+		_ = consoleSrv.Close()
+	}
+	if globalServer != nil {
+		_ = globalServer.stopProxyService()
+		if globalServer.db != nil {
+			globalServer.db.Close()
+		}
+	}
+}
+
 func main() {
 	// 允许用户在命令行设置监听地址
 	addrFlag := flag.String("listen", "", "override proxy listen address")
@@ -328,6 +473,7 @@ func main() {
 		},
 		lastActiveSessionMap: make(map[string]string),
 	}
+	globalServer = server
 
 	if err := server.loadConfig(); err != nil {
 		log.Fatalf("failed to load config: %v", err)
@@ -337,13 +483,27 @@ func main() {
 		server.config.ListenAddr = *addrFlag
 	}
 
+	// 自动探测并分配空闲端口
+	freeListenAddr, err := findFreePort(server.config.ListenAddr)
+	if err == nil {
+		if freeListenAddr != server.config.ListenAddr {
+			log.Printf("Proxy port %s occupied, fallback to %s", server.config.ListenAddr, freeListenAddr)
+		}
+		server.config.ListenAddr = freeListenAddr
+	}
+
+	freeConsoleAddr, err := findFreePort(*consoleFlag)
+	if err != nil {
+		log.Fatalf("failed to find free console port: %v", err)
+	}
+
 	// 初始化 SQLite
 	dbMgr, err := InitDB(server.config.DBPath)
 	if err != nil {
 		log.Fatalf("failed to initialize SQLite: %v", err)
 	}
 	server.db = dbMgr
-	defer dbMgr.Close()
+
 	if repaired, err := dbMgr.RepairSessionIDsFromRawRequest(); err != nil {
 		log.Printf("failed to repair session ids from request metadata: %v", err)
 	} else if repaired > 0 {
@@ -355,13 +515,10 @@ func main() {
 		log.Printf("repaired %d conversation handles from historical logs", repairedHandles)
 	}
 
-	// 1. 启动代理服务 (异步后台协程运行)
+	// 1. 启动代理服务
 	if err := server.startProxyService(); err != nil {
 		log.Fatalf("failed to start proxy service: %v", err)
 	}
-	defer func() {
-		_ = server.stopProxyService()
-	}()
 
 	// 2. 配置控制台服务
 	consoleMux := http.NewServeMux()
@@ -408,11 +565,28 @@ func main() {
 		}
 	})
 
-	log.Printf("LLM Tracer Console started on %s", *consoleFlag)
-	log.Printf("SQLite database located at %s", server.config.DBPath)
-	if err := http.ListenAndServe(*consoleFlag, consoleHandler); err != nil {
-		log.Fatalf("console server exited with error: %v", err)
+	consoleListener, err = net.Listen("tcp", freeConsoleAddr)
+	if err != nil {
+		log.Fatalf("failed to listen on console address %s: %v", freeConsoleAddr, err)
 	}
+
+	_, consolePort, _ := net.SplitHostPort(consoleListener.Addr().String())
+	globalConsoleURL = fmt.Sprintf("http://localhost:%s", consolePort)
+
+	consoleSrv = &http.Server{
+		Handler: consoleHandler,
+	}
+
+	go func() {
+		log.Printf("LLM Tracer Console started on %s", globalConsoleURL)
+		log.Printf("SQLite database located at %s", server.config.DBPath)
+		if err := consoleSrv.Serve(consoleListener); err != nil && err != http.ErrServerClosed {
+			log.Printf("console server exited with error: %v", err)
+		}
+	}()
+
+	// 启动系统托盘
+	systray.Run(onReady, onExit)
 }
 
 // (using standard io/fs instead of custom struct)

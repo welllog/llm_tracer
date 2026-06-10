@@ -414,6 +414,7 @@ export default function App() {
   const [showOpenAIKey, setShowOpenAIKey] = useState(false);
   const [showAnthropicKey, setShowAnthropicKey] = useState(false);
   const [isConfigSaving, setIsConfigSaving] = useState(false);
+  const [copiedText, setCopiedText] = useState("");
   const [activeTab, setActiveTab] = useState("trace"); // trace, prompt, raw_req, raw_resp
 
   // 折叠状态控制
@@ -2395,11 +2396,11 @@ export default function App() {
          ========================================== */}
       {isSettingsOpen && (
         <div className="fixed inset-0 bg-slate-950/70 z-50 flex items-center justify-center p-4 modal-fade-in">
-          <div className="glass-panel w-full max-w-lg overflow-hidden flex flex-col border border-slate-800/85 shadow-[0_20px_50px_rgba(0,0,0,0.85)] modal-scale-up">
-            <div className="flex justify-between items-center px-5 py-4 border-b border-slate-900">
+          <div className="glass-panel w-full max-w-4xl overflow-hidden flex flex-col border border-slate-800/85 shadow-[0_20px_50px_rgba(0,0,0,0.85)] modal-scale-up">
+            <div className="flex justify-between items-center px-5 py-4 border-b border-slate-900 shrink-0">
               <h2 className="text-base font-bold text-slate-100 flex items-center gap-2">
                 <IconSettings />
-                <span>上游模型服务配置</span>
+                <span>上游模型服务配置 & 接入指南</span>
               </h2>
               <button
                 onClick={() => setIsSettingsOpen(false)}
@@ -2409,235 +2410,263 @@ export default function App() {
               </button>
             </div>
 
-            <form
-              onSubmit={handleSaveConfig}
-              className="p-5 flex flex-col gap-5 overflow-y-auto max-h-[75vh] scroll-isolated"
-            >
-              <div className="flex flex-col gap-1.5">
-                <label className="text-xs font-semibold text-slate-300">
-                  本地代理监听地址
-                </label>
-                <input
-                  type="text"
-                  value={config.listenAddr}
-                  onChange={(e) =>
-                    setConfig({ ...config, listenAddr: e.target.value })
-                  }
-                  className="bg-slate-950/50 border border-slate-900 rounded-xl px-3.5 py-2.5 text-xs outline-none focus:border-cyan-500/50 focus:bg-slate-950/85 focus:shadow-[0_0_10px_rgba(6,182,212,0.15)] text-slate-200 transition-all font-mono"
-                  required
-                />
-                <span className="text-[10px] text-slate-500 font-medium">
-                  例如 :8080，配置后需重启代理生效
-                </span>
-                <div className="mt-1 px-3 py-2 bg-slate-950/60 border border-slate-900/60 rounded-xl flex flex-col gap-1">
-                  <span className="text-[9px] text-slate-500 uppercase font-bold tracking-wider">
-                    本地代理 API 根路径 (Base URL)
-                  </span>
-                  <code className="text-[10px] text-cyan-400 font-mono select-all break-all">
-                    {proxyBase}/v1
-                  </code>
-                </div>
-              </div>
-
-              <div className="border-t border-slate-900/60 pt-4 flex flex-col gap-3">
-                <span className="text-xs font-bold text-cyan-400 tracking-wide uppercase">
-                  OpenAI Upstream 路由
-                </span>
+            <div className="flex flex-col md:flex-row overflow-hidden min-h-0 flex-1">
+              {/* 左侧：服务配置表单 */}
+              <form
+                onSubmit={handleSaveConfig}
+                className="flex-1 p-5 flex flex-col gap-5 overflow-y-auto max-h-[70vh] scroll-isolated border-r border-slate-900/60"
+              >
                 <div className="flex flex-col gap-1.5">
-                  <label className="text-[10px] text-slate-550 font-bold">
-                    上游 Base URL
+                  <label className="text-xs font-semibold text-slate-300">
+                    本地代理监听地址
                   </label>
                   <input
                     type="text"
-                    value={config.openaiBaseURL}
+                    value={config.listenAddr}
                     onChange={(e) =>
-                      setConfig({ ...config, openaiBaseURL: e.target.value })
+                      setConfig({ ...config, listenAddr: e.target.value })
                     }
                     className="bg-slate-950/50 border border-slate-900 rounded-xl px-3.5 py-2.5 text-xs outline-none focus:border-cyan-500/50 focus:bg-slate-950/85 focus:shadow-[0_0_10px_rgba(6,182,212,0.15)] text-slate-200 transition-all font-mono"
                     required
                   />
+                  <span className="text-[10px] text-slate-500 font-medium">
+                    例如 :1238，配置后需重启代理生效
+                  </span>
+                  <div className="mt-1 px-3 py-2 bg-slate-950/60 border border-slate-900/60 rounded-xl flex flex-col gap-1">
+                    <span className="text-[9px] text-slate-500 uppercase font-bold tracking-wider">
+                      本地代理 API 根路径 (Base URL)
+                    </span>
+                    <code className="text-[10px] text-cyan-400 font-mono select-all break-all">
+                      {proxyBase}/v1
+                    </code>
+                  </div>
                 </div>
-                <div className="flex flex-col gap-1.5">
-                  <label className="text-[10px] text-slate-550 font-bold">
-                    API Key
-                  </label>
-                  <div className="relative flex items-center">
+
+                <div className="border-t border-slate-900/60 pt-4 flex flex-col gap-3">
+                  <span className="text-xs font-bold text-cyan-400 tracking-wide uppercase">
+                    OpenAI Upstream 路由
+                  </span>
+                  <div className="flex flex-col gap-1.5">
+                    <label className="text-[10px] text-slate-550 font-bold">
+                      上游 Base URL
+                    </label>
                     <input
-                      type={showOpenAIKey ? "text" : "password"}
-                      value={config.openaiAPIKey}
+                      type="text"
+                      value={config.openaiBaseURL}
                       onChange={(e) =>
-                        setConfig({ ...config, openaiAPIKey: e.target.value })
+                        setConfig({ ...config, openaiBaseURL: e.target.value })
                       }
-                      className="w-full bg-slate-950/50 border border-slate-900 rounded-xl pl-3.5 pr-10 py-2.5 text-xs outline-none focus:border-cyan-500/50 focus:bg-slate-950/85 focus:shadow-[0_0_10px_rgba(6,182,212,0.15)] text-slate-200 transition-all font-mono"
-                      placeholder="sk-..."
+                      className="bg-slate-950/50 border border-slate-900 rounded-xl px-3.5 py-2.5 text-xs outline-none focus:border-cyan-500/50 focus:bg-slate-950/85 focus:shadow-[0_0_10px_rgba(6,182,212,0.15)] text-slate-200 transition-all font-mono"
+                      required
                     />
+                  </div>
+                  <div className="flex flex-col gap-1.5">
+                    <label className="text-[10px] text-slate-550 font-bold">
+                      API Key
+                    </label>
+                    <div className="relative flex items-center">
+                      <input
+                        type={showOpenAIKey ? "text" : "password"}
+                        value={config.openaiAPIKey}
+                        onChange={(e) =>
+                          setConfig({ ...config, openaiAPIKey: e.target.value })
+                        }
+                        className="w-full bg-slate-950/50 border border-slate-900 rounded-xl pl-3.5 pr-10 py-2.5 text-xs outline-none focus:border-cyan-500/50 focus:bg-slate-950/85 focus:shadow-[0_0_10px_rgba(6,182,212,0.15)] text-slate-200 transition-all font-mono"
+                        placeholder="sk-..."
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setShowOpenAIKey(!showOpenAIKey)}
+                        className="absolute right-3 text-slate-400 hover:text-slate-200 transition-colors focus:outline-none flex items-center justify-center"
+                      >
+                        {showOpenAIKey ? <IconEyeOff /> : <IconEye />}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="border-t border-slate-900/60 pt-4 flex flex-col gap-3">
+                  <span className="text-xs font-bold text-purple-400 tracking-wide uppercase">
+                    Anthropic Upstream 路由
+                  </span>
+                  <div className="flex flex-col gap-1.5">
+                    <label className="text-[10px] text-slate-550 font-bold">
+                      上游 Base URL
+                    </label>
+                    <input
+                      type="text"
+                      value={config.anthropicBaseURL}
+                      onChange={(e) =>
+                        setConfig({ ...config, anthropicBaseURL: e.target.value })
+                      }
+                      className="bg-slate-950/50 border border-slate-900 rounded-xl px-3.5 py-2.5 text-xs outline-none focus:border-purple-500/50 focus:bg-slate-950/85 focus:shadow-[0_0_10px_rgba(139,92,246,0.15)] text-slate-200 transition-all font-mono"
+                      required
+                    />
+                  </div>
+                  <div className="flex flex-col gap-1.5">
+                    <label className="text-[10px] text-slate-550 font-bold">
+                      API Key
+                    </label>
+                    <div className="relative flex items-center">
+                      <input
+                        type={showAnthropicKey ? "text" : "password"}
+                        value={config.anthropicAPIKey}
+                        onChange={(e) =>
+                          setConfig({ ...config, anthropicAPIKey: e.target.value })
+                        }
+                        className="w-full bg-slate-950/50 border border-slate-900 rounded-xl pl-3.5 pr-10 py-2.5 text-xs outline-none focus:border-purple-500/50 focus:bg-slate-950/85 focus:shadow-[0_0_10px_rgba(139,92,246,0.15)] text-slate-200 transition-all font-mono"
+                        placeholder="sk-ant-..."
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setShowAnthropicKey(!showAnthropicKey)}
+                        className="absolute right-3 text-slate-400 hover:text-slate-200 transition-colors focus:outline-none flex items-center justify-center"
+                      >
+                        {showAnthropicKey ? <IconEyeOff /> : <IconEye />}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="border-t border-slate-900/60 pt-4 flex flex-col gap-3">
+                  <span className="text-xs font-bold text-emerald-400 tracking-wide uppercase">
+                    SQLite 数据路径
+                  </span>
+                  <div className="flex flex-col gap-1.5">
+                    <input
+                      type="text"
+                      value={config.dbPath}
+                      onChange={(e) =>
+                        setConfig({ ...config, dbPath: e.target.value })
+                      }
+                      className="bg-slate-950/50 border border-slate-900 rounded-xl px-3.5 py-2.5 text-xs outline-none focus:border-emerald-500/50 focus:bg-slate-950/85 focus:shadow-[0_0_10px_rgba(16,185,129,0.15)] text-slate-200 transition-all font-mono"
+                      required
+                    />
+                  </div>
+                </div>
+
+                <div className="flex justify-end gap-3 mt-4 pt-4 border-t border-slate-900 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => setIsSettingsOpen(false)}
+                    className="btn-secondary text-xs px-4 py-2.5 hover:bg-slate-800 transition-all duration-200 font-semibold"
+                  >
+                    取消
+                  </button>
+                  <button
+                    type="submit"
+                    className="btn-primary btn-glow-cyan text-xs px-5 py-2.5 transition-all duration-200"
+                    disabled={isConfigSaving}
+                  >
+                    {isConfigSaving ? "正在保存..." : "保存更改"}
+                  </button>
+                </div>
+              </form>
+
+              {/* 右侧：客户端接入指南 */}
+              <div className="w-full md:w-[380px] p-5 flex flex-col gap-4 overflow-y-auto max-h-[70vh] scroll-isolated bg-slate-950/20 text-xs shrink-0">
+                <div className="flex items-center gap-2 pb-2 border-b border-slate-900">
+                  <span className="text-base">🚀</span>
+                  <span className="font-bold text-slate-100">客户端接入指南</span>
+                </div>
+                <p className="text-[11px] text-slate-400 leading-relaxed">
+                  通过将您的 LLM 开发库（Python/JS 等）的 <code className="text-cyan-400">baseURL</code> 指向本地代理，即可实现日志的无感劫持与录制：
+                </p>
+
+                {/* 环境变量复制 */}
+                <div className="flex flex-col gap-2 bg-slate-900/40 p-3 rounded-xl border border-slate-900/60">
+                  <span className="text-[10px] text-slate-500 uppercase font-bold tracking-wider">
+                    方式一：系统环境变量
+                  </span>
+                  <div className="flex flex-col gap-1.5 font-mono text-[10px]">
+                    <div className="flex justify-between items-center bg-slate-950/60 p-2 rounded-lg border border-slate-900">
+                      <span className="text-cyan-400 truncate mr-2 font-semibold">export OPENAI_BASE_URL={proxyBase}/v1</span>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          navigator.clipboard.writeText(`export OPENAI_BASE_URL=${proxyBase}/v1`);
+                          setCopiedText("env_openai");
+                          setTimeout(() => setCopiedText(""), 2000);
+                        }}
+                        className="text-slate-300 hover:text-cyan-400 text-[9px] transition-colors px-1.5 py-0.5 rounded bg-slate-900/80 shrink-0 font-sans"
+                      >
+                        {copiedText === "env_openai" ? "已复制 ✔️" : "复制"}
+                      </button>
+                    </div>
+                    <div className="flex justify-between items-center bg-slate-950/60 p-2 rounded-lg border border-slate-900">
+                      <span className="text-purple-400 truncate mr-2 font-semibold">export ANTHROPIC_BASE_URL={proxyBase}/v1</span>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          navigator.clipboard.writeText(`export ANTHROPIC_BASE_URL=${proxyBase}/v1`);
+                          setCopiedText("env_anthropic");
+                          setTimeout(() => setCopiedText(""), 2000);
+                        }}
+                        className="text-slate-300 hover:text-purple-400 text-[9px] transition-colors px-1.5 py-0.5 rounded bg-slate-900/80 shrink-0 font-sans"
+                      >
+                        {copiedText === "env_anthropic" ? "已复制 ✔️" : "复制"}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Python 客户端复制 */}
+                <div className="flex flex-col gap-2 bg-slate-900/40 p-3 rounded-xl border border-slate-900/60">
+                  <div className="flex justify-between items-center">
+                    <span className="text-[10px] text-slate-500 uppercase font-bold tracking-wider font-sans">
+                      方式二：Python (openai-python)
+                    </span>
                     <button
                       type="button"
-                      onClick={() => setShowOpenAIKey(!showOpenAIKey)}
-                      className="absolute right-3 text-slate-400 hover:text-slate-200 transition-colors focus:outline-none flex items-center justify-center"
+                      onClick={() => {
+                        const code = `import openai\n\n# 将 base_url 指向 LLM Tracer 本地代理\nopenai.base_url = "${proxyBase}/v1"\n# apiKey 可填任意非空字符串\nopenai.api_key = "anything"\n\nresponse = openai.chat.completions.create(\n    model="gpt-4o",\n    messages=[{"role": "user", "content": "Hello!"}]\n)`;
+                        navigator.clipboard.writeText(code);
+                        setCopiedText("py_openai");
+                        setTimeout(() => setCopiedText(""), 2000);
+                      }}
+                      className="text-slate-400 hover:text-cyan-400 transition-colors px-1.5 py-0.5 rounded bg-slate-900/80 shrink-0 text-[9px] font-sans"
                     >
-                      {showOpenAIKey ? <IconEyeOff /> : <IconEye />}
+                      {copiedText === "py_openai" ? "已复制 ✔️" : "复制代码"}
                     </button>
                   </div>
-                </div>
-                {/* 实时本地代理 URL 展示 */}
-                <div className="mt-1 px-3 py-2.5 bg-slate-950/40 border border-slate-900/60 rounded-xl flex flex-col gap-1 text-[10px] font-mono">
-                  <div className="text-[9px] text-slate-500 uppercase font-bold tracking-wider font-sans mb-0.5">
-                    OpenAI 本地代理客户端配置
-                  </div>
-                  <div className="flex justify-between gap-2">
-                    <span className="text-slate-500">Base URL:</span>
-                    <span className="text-cyan-400/90 select-all break-all">
-                      {proxyBase}/v1
-                    </span>
-                  </div>
-                  <div className="flex justify-between gap-2 mt-0.5">
-                    <span className="text-slate-500">Chat URL:</span>
-                    <span className="text-cyan-400/90 select-all break-all">
-                      {proxyBase}/v1/chat/completions
-                    </span>
-                  </div>
-                  <div className="flex justify-between gap-2 mt-0.5">
-                    <span className="text-slate-500">Responses:</span>
-                    <span className="text-cyan-400/90 select-all break-all">
-                      {proxyBase}/v1/responses
-                    </span>
-                  </div>
+                  <pre className="bg-slate-950/80 border border-slate-900 rounded-lg p-2.5 text-[9px] font-mono text-emerald-400/90 overflow-x-auto leading-normal">
+{`import openai
 
-                  <div className="border-t border-slate-900/40 my-1.5 pt-1.5" />
-
-                  <div className="text-[9px] text-slate-500 uppercase font-bold tracking-wider font-sans mb-0.5">
-                    实际发往上游 API 校验
-                  </div>
-                  <div className="flex justify-between gap-2">
-                    <span className="text-slate-500">Chat URL:</span>
-                    <span className="text-emerald-400/90 break-all">
-                      {joinUpstreamURL(
-                        config.openaiBaseURL,
-                        "/v1/chat/completions",
-                      ) || "(未配置上游地址)"}
-                    </span>
-                  </div>
-                  <div className="flex justify-between gap-2 mt-0.5">
-                    <span className="text-slate-500">Responses:</span>
-                    <span className="text-emerald-400/90 break-all">
-                      {joinUpstreamURL(config.openaiBaseURL, "/v1/responses") ||
-                        "(未配置上游地址)"}
-                    </span>
-                  </div>
+openai.base_url = "${proxyBase}/v1"
+openai.api_key = "anything"`}
+                  </pre>
                 </div>
-              </div>
 
-              <div className="border-t border-slate-900/60 pt-4 flex flex-col gap-3">
-                <span className="text-xs font-bold text-purple-400 tracking-wide uppercase">
-                  Anthropic Upstream 路由
-                </span>
-                <div className="flex flex-col gap-1.5">
-                  <label className="text-[10px] text-slate-550 font-bold">
-                    上游 Base URL
-                  </label>
-                  <input
-                    type="text"
-                    value={config.anthropicBaseURL}
-                    onChange={(e) =>
-                      setConfig({ ...config, anthropicBaseURL: e.target.value })
-                    }
-                    className="bg-slate-950/50 border border-slate-900 rounded-xl px-3.5 py-2.5 text-xs outline-none focus:border-purple-500/50 focus:bg-slate-950/85 focus:shadow-[0_0_10px_rgba(139,92,246,0.15)] text-slate-200 transition-all font-mono"
-                    required
-                  />
-                </div>
-                <div className="flex flex-col gap-1.5">
-                  <label className="text-[10px] text-slate-550 font-bold">
-                    API Key
-                  </label>
-                  <div className="relative flex items-center">
-                    <input
-                      type={showAnthropicKey ? "text" : "password"}
-                      value={config.anthropicAPIKey}
-                      onChange={(e) =>
-                        setConfig({ ...config, anthropicAPIKey: e.target.value })
-                      }
-                      className="w-full bg-slate-950/50 border border-slate-900 rounded-xl pl-3.5 pr-10 py-2.5 text-xs outline-none focus:border-purple-500/50 focus:bg-slate-950/85 focus:shadow-[0_0_10px_rgba(139,92,246,0.15)] text-slate-200 transition-all font-mono"
-                      placeholder="sk-ant-..."
-                    />
+                {/* Node.js 客户端复制 */}
+                <div className="flex flex-col gap-2 bg-slate-900/40 p-3 rounded-xl border border-slate-900/60">
+                  <div className="flex justify-between items-center">
+                    <span className="text-[10px] text-slate-500 uppercase font-bold tracking-wider font-sans">
+                      方式三：JS / TS (openai-node)
+                    </span>
                     <button
                       type="button"
-                      onClick={() => setShowAnthropicKey(!showAnthropicKey)}
-                      className="absolute right-3 text-slate-400 hover:text-slate-200 transition-colors focus:outline-none flex items-center justify-center"
+                      onClick={() => {
+                        const code = `import OpenAI from 'openai';\n\nconst openai = new OpenAI({\n  baseURL: '${proxyBase}/v1',\n  apiKey: 'anything'\n});\n\nconst completion = await openai.chat.completions.create({\n  model: 'gpt-4o',\n  messages: [{ role: 'user', content: 'Hello!' }],\n});`;
+                        navigator.clipboard.writeText(code);
+                        setCopiedText("node_openai");
+                        setTimeout(() => setCopiedText(""), 2000);
+                      }}
+                      className="text-slate-400 hover:text-cyan-400 transition-colors px-1.5 py-0.5 rounded bg-slate-900/80 shrink-0 text-[9px] font-sans"
                     >
-                      {showAnthropicKey ? <IconEyeOff /> : <IconEye />}
+                      {copiedText === "node_openai" ? "已复制 ✔️" : "复制代码"}
                     </button>
                   </div>
-                </div>
-                {/* 实时本地代理 URL 展示 */}
-                <div className="mt-1 px-3 py-2.5 bg-slate-950/40 border border-slate-900/60 rounded-xl flex flex-col gap-1 text-[10px] font-mono">
-                  <div className="text-[9px] text-slate-500 uppercase font-bold tracking-wider font-sans mb-0.5">
-                    Anthropic 本地代理客户端配置
-                  </div>
-                  <div className="flex justify-between gap-2">
-                    <span className="text-slate-500">Base URL:</span>
-                    <span className="text-purple-400/90 select-all break-all">
-                      {proxyBase}/v1
-                    </span>
-                  </div>
-                  <div className="flex justify-between gap-2 mt-0.5">
-                    <span className="text-slate-500">Messages:</span>
-                    <span className="text-purple-400/90 select-all break-all">
-                      {proxyBase}/v1/messages
-                    </span>
-                  </div>
+                  <pre className="bg-slate-950/80 border border-slate-900 rounded-lg p-2.5 text-[9px] font-mono text-emerald-400/90 overflow-x-auto leading-normal">
+{`import OpenAI from 'openai';
 
-                  <div className="border-t border-slate-900/40 my-1.5 pt-1.5" />
-
-                  <div className="text-[9px] text-slate-500 uppercase font-bold tracking-wider font-sans mb-0.5">
-                    实际发往上游 API 校验
-                  </div>
-                  <div className="flex justify-between gap-2">
-                    <span className="text-slate-500">Messages:</span>
-                    <span className="text-emerald-400/90 break-all">
-                      {joinUpstreamURL(
-                        config.anthropicBaseURL,
-                        "/v1/messages",
-                      ) || "(未配置上游地址)"}
-                    </span>
-                  </div>
+const openai = new OpenAI({
+  baseURL: '${proxyBase}/v1',
+  apiKey: 'anything'
+});`}
+                  </pre>
                 </div>
               </div>
-
-              <div className="border-t border-slate-900/60 pt-4 flex flex-col gap-3">
-                <span className="text-xs font-bold text-emerald-400 tracking-wide uppercase">
-                  SQLite 数据路径
-                </span>
-                <div className="flex flex-col gap-1.5">
-                  <input
-                    type="text"
-                    value={config.dbPath}
-                    onChange={(e) =>
-                      setConfig({ ...config, dbPath: e.target.value })
-                    }
-                    className="bg-slate-950/50 border border-slate-900 rounded-xl px-3.5 py-2.5 text-xs outline-none focus:border-emerald-500/50 focus:bg-slate-950/85 focus:shadow-[0_0_10px_rgba(16,185,129,0.15)] text-slate-200 transition-all font-mono"
-                    required
-                  />
-                </div>
-              </div>
-
-              <div className="flex justify-end gap-3 mt-4 pt-4 border-t border-slate-900">
-                <button
-                  type="button"
-                  onClick={() => setIsSettingsOpen(false)}
-                  className="btn-secondary text-xs px-4 py-2.5 hover:bg-slate-800 transition-all duration-200 font-semibold"
-                >
-                  取消
-                </button>
-                <button
-                  type="submit"
-                  className="btn-primary btn-glow-cyan text-xs px-5 py-2.5 transition-all duration-200"
-                  disabled={isConfigSaving}
-                >
-                  {isConfigSaving ? "正在保存..." : "保存更改"}
-                </button>
-              </div>
-            </form>
+            </div>
           </div>
         </div>
       )}
