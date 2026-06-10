@@ -1,0 +1,41 @@
+# MacOS
+.DS_Store
+
+# Local Configuration
+config.json
+
+# Go Build Binaries
+llm_tracer_web
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# SQLite Database & Data
+data/
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Frontend builds and node modules (just in case)
+node_modules/
+dist/
+/static/assets/
+/static/index.html
+/static/placeholder.txt
+
+# IDEs
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Agent Temporary Workplans
+implementation_plan.md
+task.md
+walkthrough.md
