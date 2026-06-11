@@ -384,6 +384,11 @@ export default function App() {
   const [searchInput, setSearchInput] = useState("");
   const [searchKeyword, setSearchKeyword] = useState("");
   const [sessionLogs, setSessionLogs] = useState([]);
+  const totalSessionTokens = sessionLogs.reduce((sum, log) => sum + (log.totalTokens || 0), 0);
+  const totalSessionInputTokens = sessionLogs.reduce((sum, log) => sum + (log.inputTokens || 0), 0);
+  const totalSessionOutputTokens = sessionLogs.reduce((sum, log) => sum + (log.outputTokens || 0), 0);
+  const totalSessionCachedTokens = sessionLogs.reduce((sum, log) => sum + (log.cachedTokens || 0), 0);
+  const totalSessionUncachedInputTokens = totalSessionInputTokens - totalSessionCachedTokens;
   const [isSessionLoading, setIsSessionLoading] = useState(false);
   const [providerFilter, setProviderFilter] = useState("all");
   const [statusFilter, setStatusFilter] = useState("all");
@@ -1935,7 +1940,7 @@ export default function App() {
                         : "border-transparent text-slate-400 hover:text-slate-200"
                     }`}
                   >
-                    会话历史 (Session)
+                    会话历史 (Session){totalSessionTokens > 0 ? ` • ${totalSessionTokens} T` : ""}
                   </button>
                 )}
                 {selectedLog.tools && selectedLog.tools.length > 0 && (
@@ -2266,7 +2271,9 @@ export default function App() {
                     <div className="text-[10px] text-slate-400 font-bold uppercase tracking-wider mb-1 flex justify-between items-center bg-slate-950/20 px-4 py-2 border border-slate-900/50 rounded-xl">
                       <div className="flex items-center gap-2">
                         <span>🔗 会话轮次目录 / 点击可快速定位详情</span>
-                        <span className="font-mono text-cyan-400">({sessionLogs.length} 轮对话)</span>
+                        <span className="font-mono text-cyan-400">
+                          ({sessionLogs.length} 轮对话 • 未缓存输入 {totalSessionUncachedInputTokens} / 缓存 {totalSessionCachedTokens} / 输出 {totalSessionOutputTokens} / 共 {totalSessionTokens} Tokens)
+                        </span>
                       </div>
                       <button
                         onClick={() => handleDeleteSessionLogs(selectedLog.sessionId)}
@@ -2293,70 +2300,167 @@ export default function App() {
                           const isCurrent = sLog.id === selectedLog.id;
                           const isSuccess = sLog.statusCode >= 200 && sLog.statusCode < 300;
                           
-                          // 提取用户提问摘要 (优先使用 sLog 中的 prompt 内容)
-                          let userPromptSummary = "";
-                          if (sLog.prompt) {
-                            const userMsg = sLog.prompt.find(p => p.role === "user");
-                            if (userMsg && userMsg.content) {
-                              userPromptSummary = userMsg.content;
-                            }
-                          }
-                          if (!userPromptSummary && sLog.sessionSummary) {
-                            userPromptSummary = sLog.sessionSummary;
-                          }
-                          // 简化并清除标签，保留前 60 个字符作为精简展示
-                          const cleanSummary = simplifyUserPrompt(userPromptSummary);
-                          const shortSummary = cleanSummary.length > 55 ? cleanSummary.substring(0, 55) + "..." : cleanSummary;
+                           // 提取输入消息 (逆序查找最新 user 消息或 tool 消息)
+                           let inputMsg = null;
+                           if (sLog.prompt && sLog.prompt.length > 0) {
+                             for (let i = sLog.prompt.length - 1; i >= 0; i--) {
+                               const m = sLog.prompt[i];
+                               if (m.role === "user" || m.role === "tool") {
+                                 inputMsg = m;
+                                 break;
+                               }
+                             }
+                           }
 
-                          return (
-                            <div
-                              key={sLog.id}
-                              onClick={() => setModalLogId(sLog.id)}
-                              className={`p-3.5 rounded-xl border cursor-pointer relative transition-all flex flex-col gap-2 ${
-                                isCurrent
-                                  ? "bg-slate-900/70 border-cyan-500/60 shadow-[0_0_12px_rgba(6,182,212,0.15)] translate-x-0.5"
-                                  : "bg-slate-950/25 border-slate-900/80 hover:bg-slate-900/40 hover:border-slate-800/80"
-                              }`}
-                            >
-                              {/* 挂件：步骤条时间线小点/圆环 */}
-                              <div
-                                className={`absolute -left-[22px] top-6 w-2.5 h-2.5 rounded-full border-2 transition-all ${
-                                  isCurrent
-                                    ? "bg-cyan-400 border-slate-950 scale-110"
-                                    : "bg-slate-800 border-slate-950 hover:bg-slate-700"
-                                }`}
-                              />
+                           let inputText = "";
+                           let inputRoleLabel = "";
+                           let inputRoleBadgeColor = "";
+                           if (inputMsg) {
+                             if (inputMsg.role === "user") {
+                               inputRoleLabel = "👤 User";
+                               inputRoleBadgeColor = "text-cyan-400 bg-cyan-950/30 border-cyan-900/30";
+                               inputText = simplifyUserPrompt(inputMsg.content || "");
+                             } else {
+                               inputRoleLabel = `🛠️ Tool (${inputMsg.name || "unknown"})`;
+                               inputRoleBadgeColor = "text-orange-400 bg-orange-950/30 border-orange-900/30";
+                               inputText = inputMsg.content || "";
+                             }
+                           } else {
+                             inputRoleLabel = "💬 Info";
+                             inputRoleBadgeColor = "text-slate-400 bg-slate-900/40 border-slate-800/40";
+                             inputText = sLog.sessionSummary || "";
+                           }
 
-                              {/* 行一：轮次标题与模型 */}
-                              <div className="flex justify-between items-center">
-                                <div className="flex items-center gap-2">
-                                  <span className={`text-[10px] font-mono font-bold px-2 py-0.5 rounded transition-all ${
-                                    isCurrent ? "bg-cyan-950 text-cyan-400" : "bg-slate-900 text-slate-450"
-                                  }`}>
-                                    Turn #{sLog.sessionSeq || idx + 1}
-                                  </span>
-                                  <span className="text-[9px] font-mono text-slate-500 truncate max-w-[120px] md:max-w-[180px]">
-                                    {sLog.model}
-                                  </span>
-                                </div>
-                                <div className="flex items-center gap-2.5 text-[9px] font-mono text-slate-450">
-                                  <span>{sLog.createdAt ? sLog.createdAt.split(" ")[1] : ""}</span>
-                                  <span>{(sLog.durationMs / 1000).toFixed(2)}s</span>
-                                  <span className={`font-bold px-1 py-0.2 rounded ${isSuccess ? "text-emerald-400 bg-emerald-950/20" : "text-red-400 bg-red-950/20"}`}>
-                                    {sLog.statusCode}
-                                  </span>
-                                </div>
-                              </div>
+                           const shortInput = inputText && inputText.trim() !== ""
+                             ? (inputText.length > 95 ? inputText.substring(0, 95) + "..." : inputText)
+                             : "无详细输入";
 
-                              {/* 行二：用户问题文本摘要（极其紧凑） */}
-                              <div className="text-[11px] text-slate-350 flex items-start gap-1.5 leading-relaxed font-sans">
-                                <span className="text-slate-500 shrink-0">💬</span>
-                                <span className={`select-text ${isCurrent ? "text-slate-100 font-medium" : "text-slate-350 hover:text-slate-200"}`}>
-                                  {shortSummary || "（无用户输入）"}
-                                </span>
-                              </div>
-                            </div>
-                          );
+                           // 提取输出消息
+                           let outputText = "";
+                           let outputLabel = "";
+                           let outputBadgeColor = "";
+                           if (!isSuccess) {
+                             outputLabel = "❌ Error";
+                             outputBadgeColor = "text-red-400 bg-red-950/30 border-red-900/30";
+                             outputText = sLog.errorMessage || `HTTP Status ${sLog.statusCode}`;
+                           } else if (sLog.response) {
+                             const resp = sLog.response;
+                             const hasToolCalls = resp.tool_calls && resp.tool_calls.length > 0;
+                             const hasContent = resp.content && resp.content.trim() !== "";
+                             const hasThinking = resp.thinking && resp.thinking.trim() !== "";
+
+                             if (hasToolCalls) {
+                               outputLabel = "🔧 Tool Call";
+                               outputBadgeColor = "text-yellow-400 bg-yellow-950/30 border-yellow-900/30";
+                               const toolNames = resp.tool_calls.map(tc => tc.name).join(", ");
+                               outputText = `调用工具: [${toolNames}]`;
+                             } else if (hasContent) {
+                               outputLabel = "🤖 Assistant";
+                               outputBadgeColor = "text-emerald-400 bg-emerald-950/30 border-emerald-900/30";
+                               outputText = resp.content.trim();
+                             } else if (hasThinking) {
+                               outputLabel = "💭 Thinking";
+                               outputBadgeColor = "text-purple-400 bg-purple-950/30 border-purple-900/30";
+                               outputText = resp.thinking.trim();
+                             } else {
+                               outputLabel = "🤖 Assistant";
+                               outputBadgeColor = "text-slate-450 bg-slate-900/30 border-slate-800/30";
+                               outputText = "无输出内容";
+                             }
+                           } else {
+                             outputLabel = "🤖 Assistant";
+                             outputBadgeColor = "text-slate-455 bg-slate-900/30 border-slate-800/30";
+                             outputText = "无输出内容";
+                           }
+
+                           const shortOutput = outputText && outputText.trim() !== ""
+                             ? (outputText.length > 95 ? outputText.substring(0, 95) + "..." : outputText)
+                             : "无详细输出";
+
+                           return (
+                             <div
+                               key={sLog.id}
+                               onClick={() => setModalLogId(sLog.id)}
+                               className={`p-3.5 rounded-xl border cursor-pointer relative transition-all flex flex-col gap-2 ${
+                                 isCurrent
+                                   ? "bg-slate-900/70 border-cyan-500/60 shadow-[0_0_12px_rgba(6,182,212,0.15)] translate-x-0.5"
+                                   : "bg-slate-950/25 border-slate-900/80 hover:bg-slate-900/40 hover:border-slate-800/80"
+                               }`}
+                             >
+                               {/* 挂件：步骤条时间线小点/圆环 */}
+                               <div
+                                 className={`absolute -left-[22px] top-6 w-2.5 h-2.5 rounded-full border-2 transition-all ${
+                                   isCurrent
+                                     ? "bg-cyan-400 border-slate-950 scale-110"
+                                     : "bg-slate-800 border-slate-950 hover:bg-slate-700"
+                                 }`}
+                               />
+
+                               {/* 行一：轮次标题与模型 */}
+                               <div className="flex justify-between items-center">
+                                 <div className="flex items-center gap-2">
+                                   <span className={`text-[10px] font-mono font-bold px-2 py-0.5 rounded transition-all ${
+                                     isCurrent ? "bg-cyan-950 text-cyan-400" : "bg-slate-900 text-slate-450"
+                                   }`}>
+                                     Turn #{sLog.sessionSeq || idx + 1}
+                                   </span>
+                                   <span className="text-[9px] font-mono text-slate-500 truncate max-w-[120px] md:max-w-[180px]">
+                                     {sLog.model}
+                                   </span>
+                                 </div>
+                                 <div className="flex items-center gap-2.5 text-[9px] font-mono text-slate-450">
+                                   <span>{sLog.createdAt ? sLog.createdAt.split(" ")[1] : ""}</span>
+                                   <span>{(sLog.durationMs / 1000).toFixed(2)}s</span>
+                                   {sLog.totalTokens > 0 && (
+                                     <>
+                                       <span>•</span>
+                                       <span>
+                                         {sLog.totalTokens} tkn
+                                         {sLog.cachedTokens > 0 && ` (未缓存 ${sLog.inputTokens - sLog.cachedTokens})`}
+                                       </span>
+                                     </>
+                                   )}
+                                   <span className={`font-bold px-1 py-0.2 rounded ${isSuccess ? "text-emerald-400 bg-emerald-950/20" : "text-red-400 bg-red-950/20"}`}>
+                                     {sLog.statusCode}
+                                   </span>
+                                 </div>
+                               </div>
+
+                               {/* 行二：精准展示的输入输出流程图 (IN/OUT 极具 Premium 感) */}
+                               <div className="flex flex-col gap-2 mt-1 select-text">
+                                 {/* 输入段 */}
+                                 <div className="flex items-start gap-2 text-[11px] leading-relaxed">
+                                   <span className={`shrink-0 text-[8px] font-bold px-1.5 py-0.5 rounded border ${inputRoleBadgeColor} font-mono w-[60px] text-center`}>
+                                     IN
+                                   </span>
+                                   <div className="flex-1 text-slate-300 min-w-0 truncate">
+                                     <span className="text-slate-455 font-semibold mr-1">{inputRoleLabel}:</span>
+                                     <span className={isCurrent ? "text-slate-100 font-medium" : "text-slate-350 hover:text-slate-200"}>
+                                       {shortInput}
+                                     </span>
+                                   </div>
+                                 </div>
+
+                                 {/* 指示箭头 */}
+                                 <div className="pl-[23px] text-slate-650 flex items-center -my-1">
+                                   <span className="text-[9px] text-slate-600">↓</span>
+                                 </div>
+
+                                 {/* 输出段 */}
+                                 <div className="flex items-start gap-2 text-[11px] leading-relaxed">
+                                   <span className={`shrink-0 text-[8px] font-bold px-1.5 py-0.5 rounded border ${outputBadgeColor} font-mono w-[60px] text-center`}>
+                                     OUT
+                                   </span>
+                                   <div className="flex-1 text-slate-300 min-w-0 truncate">
+                                     <span className="text-slate-455 font-semibold mr-1">{outputLabel}:</span>
+                                     <span className={isCurrent ? "text-slate-100 font-medium" : "text-slate-350 hover:text-slate-200"}>
+                                       {shortOutput}
+                                     </span>
+                                   </div>
+                                 </div>
+                               </div>
+                             </div>
+                           );
                         })}
                       </div>
                     )}

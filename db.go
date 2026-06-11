@@ -95,6 +95,7 @@ func InitDB(dbPath string) (*DBManager, error) {
 	// 设置 SQLite 的一些性能优化选项
 	_, _ = db.Exec("PRAGMA journal_mode=WAL;")
 	_, _ = db.Exec("PRAGMA synchronous=NORMAL;")
+	_, _ = db.Exec("PRAGMA busy_timeout = 5000;")
 
 	mgr := &DBManager{db: db}
 	if err := mgr.createTables(); err != nil {
@@ -788,7 +789,7 @@ func (mgr *DBManager) GetStats() (*UsageStats, error) {
 		       COALESCE(SUM(output_tokens), 0),
 		       COALESCE(SUM(total_tokens + CASE WHEN provider = 'anthropic' THEN cache_read_tokens ELSE 0 END), 0),
 		       COALESCE(AVG(duration_ms), 0),
-		       SUM(CASE WHEN status_code >= 200 AND status_code < 300 THEN 1 ELSE 0 END),
+		       COALESCE(SUM(CASE WHEN status_code >= 200 AND status_code < 300 THEN 1 ELSE 0 END), 0),
 		       COALESCE(SUM(CASE WHEN provider = 'anthropic' THEN cache_read_tokens ELSE cached_tokens END), 0)
 		FROM logs
 	`

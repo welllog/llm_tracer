@@ -126,12 +126,13 @@ type openAIResponsesResponse struct {
 }
 
 type openAIMessage struct {
-	Role         string          `json:"role"`
-	Content      json.RawMessage `json:"content"` // 可能为 string 或 array
-	Name         string          `json:"name,omitempty"`
-	ToolCalls    []openAIToolCall `json:"tool_calls,omitempty"`
-	ToolCallID   string          `json:"tool_call_id,omitempty"`
-	FunctionCall *struct {
+	Role             string           `json:"role"`
+	Content          json.RawMessage  `json:"content"` // 可能为 string 或 array
+	Name             string           `json:"name,omitempty"`
+	ReasoningContent string           `json:"reasoning_content,omitempty"`
+	ToolCalls        []openAIToolCall `json:"tool_calls,omitempty"`
+	ToolCallID       string           `json:"tool_call_id,omitempty"`
+	FunctionCall     *struct {
 		Name      string `json:"name"`
 		Arguments string `json:"arguments"`
 	} `json:"function_call,omitempty"`
@@ -189,6 +190,7 @@ func ParseOpenAIRequest(body []byte) (string, []ChatMessage, []ToolDef, error) {
 			Role:       m.Role,
 			Content:    contentStr,
 			Name:       m.Name,
+			Thinking:   m.ReasoningContent,
 			ToolCallID: m.ToolCallID,
 		}
 
@@ -811,11 +813,16 @@ func ParseAnthropicRequest(body []byte) (string, []ChatMessage, []ToolDef, error
 		var blocks []map[string]any
 		if err := json.Unmarshal(m.Content, &blocks); err == nil {
 			var textParts []string
+			var thinkingParts []string
 			for _, block := range blocks {
 				bType, _ := block["type"].(string)
 				if bType == "text" {
 					if text, ok := block["text"].(string); ok {
 						textParts = append(textParts, text)
+					}
+				} else if bType == "thinking" {
+					if thinking, ok := block["thinking"].(string); ok {
+						thinkingParts = append(thinkingParts, thinking)
 					}
 				} else if bType == "tool_use" {
 					id, _ := block["id"].(string)
@@ -838,6 +845,7 @@ func ParseAnthropicRequest(body []byte) (string, []ChatMessage, []ToolDef, error
 				}
 			}
 			msg.Content = strings.Join(textParts, "\n")
+			msg.Thinking = strings.Join(thinkingParts, "\n")
 		} else {
 			// 普通字符串
 			var str string

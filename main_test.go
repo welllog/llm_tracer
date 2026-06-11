@@ -336,6 +336,15 @@ func TestStatsAggregations(t *testing.T) {
 	dbMgr, _ := InitDB(dbPath)
 	defer dbMgr.Close()
 
+	// Test GetStats on empty database to verify COALESCE works and doesn't return NULL scan error
+	emptyStats, err := dbMgr.GetStats()
+	if err != nil {
+		t.Fatalf("Failed to get stats on empty DB: %v", err)
+	}
+	if emptyStats.TotalCalls != 0 || emptyStats.SuccessCalls != 0 {
+		t.Errorf("Expected 0 calls on empty DB, got total %d, success %d", emptyStats.TotalCalls, emptyStats.SuccessCalls)
+	}
+
 	// 插入几条模拟日志
 	_, _ = dbMgr.InsertLog(&UnifiedLog{
 		Provider:     "openai",
@@ -1432,4 +1441,75 @@ func TestDeleteSessionLogs(t *testing.T) {
 		t.Fatalf("expected 1 handle for id3, got %d", count)
 	}
 }
+
+func TestParseThinkingAndReasoningRequest(t *testing.T) {
+	// 1. 测试 Anthropic 请求中的 thinking 块解析
+	anthropicReqBody := []byte(`{
+		"model": "claude-3-5-sonnet",
+		"messages": [
+			{
+				"role": "user",
+				"content": "Hello"
+			},
+			{
+				"role": "assistant",
+				"content": [
+					{
+						"type": "thinking",
+						"thinking": "This is a Sonnet thinking process."
+					},
+					{
+						"type": "text",
+						"text": "Hello, how can I help you today?"
+					}
+				]
+			}
+		]
+	}`)
+	_, messages, _, err := ParseAnthropicRequest(anthropicReqBody)
+	if err != nil {
+		t.Fatalf("ParseAnthropicRequest failed: %v", err)
+	}
+	if len(messages) != 2 {
+		t.Fatalf("expected 2 messages, got %d", len(messages))
+	}
+	assistantMsg := messages[1]
+	if assistantMsg.Thinking != "This is a Sonnet thinking process." {
+		t.Errorf("expected thinking content 'This is a Sonnet thinking process.', got %q", assistantMsg.Thinking)
+	}
+	if assistantMsg.Content != "Hello, how can I help you today?" {
+		t.Errorf("expected text content 'Hello, how can I help you today.', got %q", assistantMsg.Content)
+	}
+
+	// 2. 测试 OpenAI 请求中的 reasoning_content 字段解析
+	openaiReqBody := []byte(`{
+		"model": "deepseek-reasoner",
+		"messages": [
+			{
+				"role": "user",
+				"content": "Solve 1+1"
+			},
+			{
+				"role": "assistant",
+				"content": "1+1 equals 2",
+				"reasoning_content": "To solve this, I will add one and one together, which equals two."
+			}
+		]
+	}`)
+	_, oMessages, _, err := ParseOpenAIRequest(openaiReqBody)
+	if err != nil {
+		t.Fatalf("ParseOpenAIRequest failed: %v", err)
+	}
+	if len(oMessages) != 2 {
+		t.Fatalf("expected 2 messages, got %d", len(oMessages))
+	}
+	openaiAssistantMsg := oMessages[1]
+	if openaiAssistantMsg.Thinking != "To solve this, I will add one and one together, which equals two." {
+		t.Errorf("expected thinking content to be populated from reasoning_content, got %q", openaiAssistantMsg.Thinking)
+	}
+	if openaiAssistantMsg.Content != "1+1 equals 2" {
+		t.Errorf("expected content to be '1+1 equals 2', got %q", openaiAssistantMsg.Content)
+	}
+}
+
 
