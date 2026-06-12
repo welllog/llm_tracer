@@ -532,6 +532,7 @@ func main() {
 	consoleMux.HandleFunc("GET /api/config", server.handleGetConfig)
 	consoleMux.HandleFunc("POST /api/config", server.handleSetConfig)
 	consoleMux.HandleFunc("GET /api/logs", server.handleGetLogs)
+	consoleMux.HandleFunc("GET /api/sessions", server.handleGetSessions)
 	consoleMux.HandleFunc("GET /api/logs/{id}", server.handleGetLogDetail)
 	consoleMux.HandleFunc("GET /api/sessions/{id}/logs", server.handleGetSessionLogs)
 	consoleMux.HandleFunc("GET /api/stats", server.handleGetStats)
@@ -749,7 +750,19 @@ func (s *ProxyServer) handleDeleteSessionLogs(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	if err := s.db.DeleteSessionLogs(sessionID); err != nil {
+	// 如果是以 standalone- 开头的虚拟会话，按 log id 删除
+	if strings.HasPrefix(sessionID, "standalone-") {
+		logIDStr := strings.TrimPrefix(sessionID, "standalone-")
+		logID, err := strconv.ParseInt(logIDStr, 10, 64)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("invalid standalone log id: %v", err), http.StatusBadRequest)
+			return
+		}
+		if err := s.db.DeleteLog(logID); err != nil {
+			http.Error(w, fmt.Sprintf("delete standalone log: %v", err), http.StatusInternalServerError)
+			return
+		}
+	} else if err := s.db.DeleteSessionLogs(sessionID); err != nil {
 		http.Error(w, fmt.Sprintf("delete session logs: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -757,6 +770,27 @@ func (s *ProxyServer) handleDeleteSessionLogs(w http.ResponseWriter, r *http.Req
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(`{"status":"ok"}`))
+}
+
+func (s *ProxyServer) handleGetSessions(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	page, _ := strconv.Atoi(q.Get("page"))
+	pageSize, _ := strconv.Atoi(q.Get("pageSize"))
+	keyword := q.Get("keyword")
+
+	sessions, total, err := s.db.GetSessions(page, pageSize, keyword)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("query sessions: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"list":     sessions,
+		"total":    total,
+		"page":     page,
+		"pageSize": pageSize,
+	})
 }
 
 func (s *ProxyServer) handleGetSystemLogs(w http.ResponseWriter, r *http.Request) {
@@ -1061,11 +1095,7 @@ func (s *ProxyServer) proxyAPI(w http.ResponseWriter, r *http.Request, provider,
 		ResponseHandles:     responseHandles,
 	}
 
-	// 如果在上游没抓到 usage，如果是 openai-responses 或特殊情况，我们可以在解析出的模型响应中做修正
-	if logRecord.TotalTokens == 0 {
-		logRecord.InputTokens = len(promptMsgs) * 5
-		logRecord.TotalTokens = logRecord.InputTokens + logRecord.OutputTokens
-	}
+	// 如果在上游没抓到 usage，保持 0 而不是编造数字，避免污染统计数据
 
 	insertID, dbErr := s.db.InsertLog(logRecord)
 	if dbErr != nil {

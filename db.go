@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -79,6 +80,17 @@ type UsageStats struct {
 	SuccessRate       float64         `json:"successRate"`
 	CallsByProvider   map[string]int  `json:"callsByProvider"`
 	TokensByModel     map[string]int  `json:"tokensByModel"`
+}
+
+type SessionMetadata struct {
+	SessionID      string `json:"sessionId"`
+	SessionSummary string `json:"sessionSummary"`
+	StartTime      string `json:"startTime"`
+	EndTime        string `json:"endTime"`
+	TotalTokens    int    `json:"totalTokens"`
+	MessageCount   int    `json:"messageCount"`
+	Model          string `json:"model"`
+	Provider       string `json:"provider"`
 }
 
 func InitDB(dbPath string) (*DBManager, error) {
@@ -455,13 +467,19 @@ func (mgr *DBManager) GetSessionLogs(sessionID string) ([]UnifiedLog, error) {
 		}
 
 		if promptStr != "" {
-			_ = json.Unmarshal([]byte(promptStr), &s.Prompt)
+			if err := json.Unmarshal([]byte(promptStr), &s.Prompt); err != nil {
+				log.Printf("GetSessionLogs: failed to unmarshal prompt_json for log %d: %v", s.ID, err)
+			}
 		}
 		if respStr != "" {
-			_ = json.Unmarshal([]byte(respStr), &s.Response)
+			if err := json.Unmarshal([]byte(respStr), &s.Response); err != nil {
+				log.Printf("GetSessionLogs: failed to unmarshal response_json for log %d: %v", s.ID, err)
+			}
 		}
 		if toolsStr != "" {
-			_ = json.Unmarshal([]byte(toolsStr), &s.Tools)
+			if err := json.Unmarshal([]byte(toolsStr), &s.Tools); err != nil {
+				log.Printf("GetSessionLogs: failed to unmarshal tools_json for log %d: %v", s.ID, err)
+			}
 		}
 
 		if s.Provider == "anthropic" {
@@ -506,15 +524,21 @@ func (mgr *DBManager) GetLogDetail(id int64) (*UnifiedLog, error) {
 	}
 
 	if promptStr != "" {
-		_ = json.Unmarshal([]byte(promptStr), &logUnified.Prompt)
+		if err := json.Unmarshal([]byte(promptStr), &logUnified.Prompt); err != nil {
+			log.Printf("GetLogDetail: failed to unmarshal prompt_json for log %d: %v", logUnified.ID, err)
+		}
 	}
 
 	if respStr != "" {
-		_ = json.Unmarshal([]byte(respStr), &logUnified.Response)
+		if err := json.Unmarshal([]byte(respStr), &logUnified.Response); err != nil {
+			log.Printf("GetLogDetail: failed to unmarshal response_json for log %d: %v", logUnified.ID, err)
+		}
 	}
 
 	if toolsStr != "" {
-		_ = json.Unmarshal([]byte(toolsStr), &logUnified.Tools)
+		if err := json.Unmarshal([]byte(toolsStr), &logUnified.Tools); err != nil {
+			log.Printf("GetLogDetail: failed to unmarshal tools_json for log %d: %v", logUnified.ID, err)
+		}
 	}
 
 	if logUnified.Provider == "anthropic" {
@@ -579,13 +603,19 @@ func (mgr *DBManager) GetLogDetail(id int64) (*UnifiedLog, error) {
 			)
 			if err == nil {
 				if subPromptStr != "" {
-					_ = json.Unmarshal([]byte(subPromptStr), &subLog.Prompt)
+					if err := json.Unmarshal([]byte(subPromptStr), &subLog.Prompt); err != nil {
+						log.Printf("GetLogDetail: failed to unmarshal sub-log prompt_json for log %d: %v", subLog.ID, err)
+					}
 				}
 				if subRespStr != "" {
-					_ = json.Unmarshal([]byte(subRespStr), &subLog.Response)
+					if err := json.Unmarshal([]byte(subRespStr), &subLog.Response); err != nil {
+						log.Printf("GetLogDetail: failed to unmarshal sub-log response_json for log %d: %v", subLog.ID, err)
+					}
 				}
 				if subToolsStr != "" {
-					_ = json.Unmarshal([]byte(subToolsStr), &subLog.Tools)
+					if err := json.Unmarshal([]byte(subToolsStr), &subLog.Tools); err != nil {
+						log.Printf("GetLogDetail: failed to unmarshal sub-log tools_json for log %d: %v", subLog.ID, err)
+					}
 				}
 				if subLog.Provider == "anthropic" {
 					subLog.CachedTokens = subLog.CacheReadTokens
@@ -956,7 +986,94 @@ func (mgr *DBManager) GetLatestLogIDBySession(sessionID string) (*int64, error) 
 	return &id, nil
 }
 
+func (mgr *DBManager) GetSessions(page, pageSize int, keyword string) ([]SessionMetadata, int, error) {
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 {
+		pageSize = 20
+	}
+	offset := (page - 1) * pageSize
 
+	// 1. 获取总数
+	countQuery := `
+		SELECT COUNT(DISTINCT CASE WHEN session_id IS NOT NULL AND session_id != '' THEN session_id ELSE 'standalone-' || id END)
+		FROM logs
+		WHERE 1=1`
+	args := []any{}
+	if keyword != "" {
+		countQuery += " AND (raw_request LIKE ? OR raw_response LIKE ? OR error_message LIKE ?)"
+		likeArg := "%" + keyword + "%"
+		args = append(args, likeArg, likeArg, likeArg)
+	}
+
+	var total int
+	err := mgr.db.QueryRow(countQuery, args...).Scan(&total)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	// 2. 分页获取会话信息
+	dataQuery := fmt.Sprintf(`
+		WITH SessionGroups AS (
+			SELECT
+				CASE WHEN session_id IS NOT NULL AND session_id != '' THEN session_id ELSE 'standalone-' || id END as effective_session_id,
+				MIN(id) as first_id,
+				MAX(id) as last_id,
+				datetime(MIN(created_at), 'localtime') as start_time,
+				datetime(MAX(created_at), 'localtime') as end_time,
+				SUM(total_tokens) as sum_tokens,
+				COUNT(*) as msg_count,
+				MAX(model) as last_model,
+				MAX(provider) as last_provider
+			FROM logs
+			WHERE 1=1 %s
+			GROUP BY effective_session_id
+		)
+		SELECT effective_session_id, first_id, last_id, start_time, end_time, sum_tokens, msg_count, last_model, last_provider
+		FROM SessionGroups
+		ORDER BY last_id DESC
+		LIMIT ? OFFSET ?`, func() string {
+		if keyword != "" {
+			return " AND (raw_request LIKE ? OR raw_response LIKE ? OR error_message LIKE ?)"
+		}
+		return ""
+	}())
+
+	dataArgs := append(args, pageSize, offset)
+	rows, err := mgr.db.Query(dataQuery, dataArgs...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	var sessions []SessionMetadata
+	for rows.Next() {
+		var s SessionMetadata
+		var firstID, lastID int64
+		err := rows.Scan(
+			&s.SessionID, &firstID, &lastID, &s.StartTime, &s.EndTime,
+			&s.TotalTokens, &s.MessageCount, &s.Model, &s.Provider,
+		)
+		if err != nil {
+			return nil, 0, err
+		}
+
+		// 获取摘要 (通常是第一条消息)
+		var promptStr string
+		err = mgr.db.QueryRow("SELECT prompt_json FROM logs WHERE id = ?", firstID).Scan(&promptStr)
+		if err == nil && promptStr != "" {
+			var msgs []ChatMessage
+			if json.Unmarshal([]byte(promptStr), &msgs) == nil {
+				s.SessionSummary = extractPromptSummary(msgs)
+			}
+		}
+
+		sessions = append(sessions, s)
+	}
+
+	return sessions, total, nil
+}
 
 func (mgr *DBManager) DeleteLog(id int64) error {
 	tx, err := mgr.db.Begin()
@@ -993,7 +1110,7 @@ func (mgr *DBManager) DeleteSessionLogs(sessionID string) error {
 
 	// 1. 删除 log_handles 中所有属于该会话 logs 的记录
 	_, err = tx.Exec(`
-		DELETE FROM log_handles 
+		DELETE FROM log_handles
 		WHERE log_id IN (SELECT id FROM logs WHERE session_id = ?)
 	`, sessionID)
 	if err != nil {
@@ -1008,4 +1125,3 @@ func (mgr *DBManager) DeleteSessionLogs(sessionID string) error {
 
 	return tx.Commit()
 }
-

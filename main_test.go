@@ -1511,5 +1511,3 @@ func TestParseThinkingAndReasoningRequest(t *testing.T) {
 		t.Errorf("expected content to be '1+1 equals 2', got %q", openaiAssistantMsg.Content)
 	}
 }
-
-
