@@ -73,7 +73,6 @@ type openAIRequest struct {
 		Description string          `json:"description,omitempty"`
 		Parameters  json.RawMessage `json:"parameters,omitempty"`
 	} `json:"functions"` // 适配旧版兼容性或部分特定 Agent 的习惯
-	System    string                  `json:"system"`
 }
 
 type openAIResponsesRequest struct {
@@ -941,21 +940,12 @@ func ParseAnthropicResponseWithHandles(body []byte) (ResponseParseResult, error)
 
 // 增量解析 Anthropic SSE 流式数据
 func ParseAnthropicStreamChunk(chunk []byte, currentResp *ChatMessage, currentUsage *TokenUsage, currentBlockIndex *int) error {
-	line := string(chunk)
-	if !strings.HasPrefix(line, "event: ") && !strings.HasPrefix(line, "data: ") {
+	line := strings.TrimSpace(string(chunk))
+	if !strings.HasPrefix(line, "data: ") {
 		return nil
 	}
 
-	// 提取出 "data: " 那一行
-	var dataStr string
-	lines := strings.Split(line, "\n")
-	for _, l := range lines {
-		l = strings.TrimSpace(l)
-		if strings.HasPrefix(l, "data: ") {
-			dataStr = strings.TrimPrefix(l, "data: ")
-			break
-		}
-	}
+	dataStr := strings.TrimPrefix(line, "data: ")
 	if dataStr == "" {
 		return nil
 	}
@@ -1103,15 +1093,6 @@ func parseAnthropicContent(raw json.RawMessage) string {
 		}
 	}
 	return strings.Join(lines, "\n")
-}
-
-// 统一解析入口，方便代理过程调用
-func ParseUnifiedRequest(path string, body []byte) (string, []ChatMessage, []ToolDef, string, error) {
-	result, err := ParseUnifiedRequestEnvelope(path, body)
-	if err != nil {
-		return "", nil, nil, "", err
-	}
-	return result.Model, result.Messages, result.Tools, result.Provider, nil
 }
 
 func ParseUnifiedRequestEnvelope(path string, body []byte) (RequestParseResult, error) {
@@ -1291,14 +1272,6 @@ func compactHandles(handles []ConversationHandle) []ConversationHandle {
 		return nil
 	}
 	return compacted
-}
-
-func ParseUnifiedResponse(path string, body []byte) (string, ChatMessage, TokenUsage, error) {
-	result, err := ParseUnifiedResponseEnvelope(path, body)
-	if err != nil {
-		return "", ChatMessage{}, TokenUsage{}, err
-	}
-	return result.Model, result.Message, result.Usage, nil
 }
 
 func ParseUnifiedResponseEnvelope(path string, body []byte) (ResponseParseResult, error) {

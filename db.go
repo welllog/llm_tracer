@@ -93,6 +93,24 @@ type SessionMetadata struct {
 	Provider       string `json:"provider"`
 }
 
+func (log *LogSummary) normalizeAnthropicTokens() {
+	if log.Provider != "anthropic" {
+		return
+	}
+	log.CachedTokens = log.CacheReadTokens
+	log.InputTokens += log.CacheReadTokens
+	log.TotalTokens = log.InputTokens + log.OutputTokens
+}
+
+func (log *UnifiedLog) normalizeAnthropicTokens() {
+	if log.Provider != "anthropic" {
+		return
+	}
+	log.CachedTokens = log.CacheReadTokens
+	log.InputTokens += log.CacheReadTokens
+	log.TotalTokens = log.InputTokens + log.OutputTokens
+}
+
 func InitDB(dbPath string) (*DBManager, error) {
 	dir := filepath.Dir(dbPath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -348,11 +366,7 @@ func (mgr *DBManager) GetLogs(page, pageSize int, provider, model, keyword strin
 		if err != nil {
 			return nil, 0, err
 		}
-		if s.Provider == "anthropic" {
-			s.CachedTokens = s.CacheReadTokens
-			s.InputTokens = s.InputTokens + s.CacheReadTokens
-			s.TotalTokens = s.InputTokens + s.OutputTokens
-		}
+		s.normalizeAnthropicTokens()
 		summaries = append(summaries, s)
 	}
 
@@ -388,34 +402,29 @@ func (mgr *DBManager) GetLogs(page, pageSize int, provider, model, keyword strin
 
 		subRows, err := mgr.db.Query(query, queryArgs...)
 		if err == nil {
-			defer subRows.Close()
 			summariesMap := make(map[string]string)
+			meaningfulMap := make(map[string]bool)
 			for subRows.Next() {
 				var sID, promptStr string
 				if err := subRows.Scan(&sID, &promptStr); err == nil && promptStr != "" {
-					// 如果该会话已经获取到了非空且有效的用户提问摘要，我们跳过（因为我们只想要最早的那个真实摘要）
-					if summariesMap[sID] != "" {
+					if meaningfulMap[sID] {
 						continue
 					}
 					var msgs []ChatMessage
 					if err := json.Unmarshal([]byte(promptStr), &msgs); err == nil {
 						summary := extractPromptSummary(msgs)
 						if summary != "" {
-							// 策略：如果是非常短的问候语（由 extractPromptSummary 识别），
-							// 我们暂存它但继续寻找后面日志中更具描述性的摘要
 							if isMeaningfulSummary(summary) {
 								summariesMap[sID] = summary
-								continue // 找到了正式摘要，不再看这个会话的其他日志
-							} else {
-								// 如果还没有摘要，先用这个垫底
-								if _, ok := summariesMap[sID]; !ok {
-									summariesMap[sID] = summary
-								}
+								meaningfulMap[sID] = true
+							} else if summariesMap[sID] == "" {
+								summariesMap[sID] = summary
 							}
 						}
 					}
 				}
 			}
+			subRows.Close()
 
 			for i := range summaries {
 				if sum, ok := summariesMap[summaries[i].SessionID]; ok {
@@ -482,12 +491,7 @@ func (mgr *DBManager) GetSessionLogs(sessionID string) ([]UnifiedLog, error) {
 			}
 		}
 
-		if s.Provider == "anthropic" {
-			s.CachedTokens = s.CacheReadTokens
-			s.InputTokens = s.InputTokens + s.CacheReadTokens
-			s.TotalTokens = s.InputTokens + s.OutputTokens
-		}
-
+		s.normalizeAnthropicTokens()
 		logs = append(logs, s)
 	}
 
@@ -541,11 +545,7 @@ func (mgr *DBManager) GetLogDetail(id int64) (*UnifiedLog, error) {
 		}
 	}
 
-	if logUnified.Provider == "anthropic" {
-		logUnified.CachedTokens = logUnified.CacheReadTokens
-		logUnified.InputTokens = logUnified.InputTokens + logUnified.CacheReadTokens
-		logUnified.TotalTokens = logUnified.InputTokens + logUnified.OutputTokens
-	}
+	logUnified.normalizeAnthropicTokens()
 
 	// 填充详情的 sessionSummary
 	if logUnified.SessionID != "" {
@@ -557,20 +557,22 @@ func (mgr *DBManager) GetLogDetail(id int64) (*UnifiedLog, error) {
 			LIMIT 3
 		`, logUnified.SessionID)
 		if err == nil {
-			defer subRows.Close()
 			for subRows.Next() {
 				var promptStr string
 				if subRows.Scan(&promptStr) == nil && promptStr != "" {
 					var msgs []ChatMessage
-					if json.Unmarshal([]byte(promptStr), &msgs) == nil {
+					if err := json.Unmarshal([]byte(promptStr), &msgs); err == nil {
 						summary := extractPromptSummary(msgs)
 						if summary != "" {
 							logUnified.SessionSummary = summary
-							break
+							if isMeaningfulSummary(summary) {
+								break
+							}
 						}
 					}
 				}
 			}
+			subRows.Close()
 		}
 	}
 
@@ -590,7 +592,6 @@ func (mgr *DBManager) GetLogDetail(id int64) (*UnifiedLog, error) {
 	`
 	rows, err := mgr.db.Query(subQuery, logUnified.ID)
 	if err == nil {
-		defer rows.Close()
 		for rows.Next() {
 			var subLog UnifiedLog
 			var subPromptStr, subRespStr, subToolsStr string
@@ -617,14 +618,11 @@ func (mgr *DBManager) GetLogDetail(id int64) (*UnifiedLog, error) {
 						log.Printf("GetLogDetail: failed to unmarshal sub-log tools_json for log %d: %v", subLog.ID, err)
 					}
 				}
-				if subLog.Provider == "anthropic" {
-					subLog.CachedTokens = subLog.CacheReadTokens
-					subLog.InputTokens = subLog.InputTokens + subLog.CacheReadTokens
-					subLog.TotalTokens = subLog.InputTokens + subLog.OutputTokens
-				}
+				subLog.normalizeAnthropicTokens()
 				logUnified.SubLogs = append(logUnified.SubLogs, subLog)
 			}
 		}
+		rows.Close()
 	}
 
 	return &logUnified, nil
@@ -1059,13 +1057,35 @@ func (mgr *DBManager) GetSessions(page, pageSize int, keyword string) ([]Session
 			return nil, 0, err
 		}
 
-		// 获取摘要 (通常是第一条消息)
-		var promptStr string
-		err = mgr.db.QueryRow("SELECT prompt_json FROM logs WHERE id = ?", firstID).Scan(&promptStr)
-		if err == nil && promptStr != "" {
-			var msgs []ChatMessage
-			if json.Unmarshal([]byte(promptStr), &msgs) == nil {
-				s.SessionSummary = extractPromptSummary(msgs)
+		// 获取摘要 (尝试寻找有意义的提问)
+		if strings.HasPrefix(s.SessionID, "standalone-") {
+			var promptStr string
+			err = mgr.db.QueryRow("SELECT prompt_json FROM logs WHERE id = ?", firstID).Scan(&promptStr)
+			if err == nil && promptStr != "" {
+				var msgs []ChatMessage
+				if json.Unmarshal([]byte(promptStr), &msgs) == nil {
+					s.SessionSummary = extractPromptSummary(msgs)
+				}
+			}
+		} else {
+			subRows, err := mgr.db.Query("SELECT prompt_json FROM logs WHERE session_id = ? ORDER BY id ASC LIMIT 3", s.SessionID)
+			if err == nil {
+				for subRows.Next() {
+					var promptStr string
+					if subRows.Scan(&promptStr) == nil && promptStr != "" {
+						var msgs []ChatMessage
+						if err := json.Unmarshal([]byte(promptStr), &msgs); err == nil {
+							summary := extractPromptSummary(msgs)
+							if summary != "" {
+								s.SessionSummary = summary
+								if isMeaningfulSummary(summary) {
+									break
+								}
+							}
+						}
+					}
+				}
+				subRows.Close()
 			}
 		}
 

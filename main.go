@@ -72,6 +72,34 @@ type SuspendedTool struct {
 	CreatedAt  time.Time
 }
 
+const suspendedToolTTL = 1800 * time.Second // 30 分钟
+const suspendedToolMaxCap = 500
+
+func (s *ProxyServer) pruneExpiredSuspendedTools(now time.Time) {
+	cutoff := now.Add(-suspendedToolTTL)
+	n := 0
+	for _, st := range s.suspendedTools {
+		if st.CreatedAt.After(cutoff) {
+			s.suspendedTools[n] = st
+			n++
+		}
+	}
+	// 将尾部置零，避免内存引用残留
+	for i := n; i < len(s.suspendedTools); i++ {
+		s.suspendedTools[i] = SuspendedTool{}
+	}
+	s.suspendedTools = s.suspendedTools[:n]
+
+	// 兜底：总量上限裁剪（保留最新的）
+	if len(s.suspendedTools) > suspendedToolMaxCap {
+		overflow := s.suspendedTools[:len(s.suspendedTools)-suspendedToolMaxCap]
+		s.suspendedTools = s.suspendedTools[len(s.suspendedTools)-suspendedToolMaxCap:]
+		for i := range overflow {
+			overflow[i] = SuspendedTool{}
+		}
+	}
+}
+
 func semanticMatchScore(promptText, arguments string) float64 {
 	promptText = strings.ToLower(promptText)
 	arguments = strings.ToLower(arguments)
@@ -141,13 +169,6 @@ func semanticMatchScore(promptText, arguments string) float64 {
 
 func semanticMatch(promptText, arguments string) bool {
 	return semanticMatchScore(promptText, arguments) > 0
-}
-
-func maskAPIKey(key string) string {
-	if len(key) <= 8 {
-		return "********"
-	}
-	return key[:4] + "..." + key[len(key)-4:]
 }
 
 func (s *ProxyServer) loadConfig() error {
@@ -410,16 +431,17 @@ func onReady() {
 	mQuit := systray.AddMenuItem("退出", "关闭服务并退出")
 
 	// 自动打开默认浏览器
+	url := globalConsoleURL
 	go func() {
 		time.Sleep(500 * time.Millisecond) // 等待监听就绪
-		_ = openBrowser(globalConsoleURL)
+		_ = openBrowser(url)
 	}()
 
 	go func() {
 		for {
 			select {
 			case <-mOpen.ClickedCh:
-				_ = openBrowser(globalConsoleURL)
+				_ = openBrowser(url)
 			case <-mRestart.ClickedCh:
 				log.Println("Restarting proxy service from tray...")
 				if err := globalServer.restartProxyService(); err != nil {
@@ -468,14 +490,6 @@ func main() {
 	addrFlag := flag.String("listen", "", "override proxy listen address")
 	consoleFlag := flag.String("console", ":56129", "override console listen address")
 	flag.Parse()
-
-	// 确保静态目录存在，以便 go build 即使没有构建前端时也不会因为 embed 找不到目录而报错。
-	_ = os.MkdirAll("static", 0755)
-	// 如果 static 下面是空的，写入一个占位文件，以便 go:embed static/* 不会报错
-	placeholderPath := filepath.Join("static", "placeholder.txt")
-	if _, err := os.Stat(placeholderPath); os.IsNotExist(err) {
-		_ = os.WriteFile(placeholderPath, []byte("Vite frontend assets will go here"), 0644)
-	}
 
 	server := &ProxyServer{
 		client: &http.Client{
@@ -589,11 +603,23 @@ func main() {
 		Handler: consoleHandler,
 	}
 
+	consoleURL := globalConsoleURL
 	go func() {
-		log.Printf("LLM Tracer Console started on %s", globalConsoleURL)
+		log.Printf("LLM Tracer Console started on %s", consoleURL)
 		log.Printf("SQLite database located at %s", server.config.DBPath)
 		if err := consoleSrv.Serve(consoleListener); err != nil && err != http.ErrServerClosed {
 			log.Printf("console server exited with error: %v", err)
+		}
+	}()
+
+	// 后台定期清理过期的 suspended tool calls（兜底：无请求到达时也能回收）
+	go func() {
+		ticker := time.NewTicker(60 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			server.suspMu.Lock()
+			server.pruneExpiredSuspendedTools(time.Now())
+			server.suspMu.Unlock()
 		}
 	}()
 
@@ -1037,6 +1063,7 @@ func (s *ProxyServer) proxyAPI(w http.ResponseWriter, r *http.Request, provider,
 		respBody, err := io.ReadAll(bodyReader)
 		if err != nil {
 			log.Printf("Failed to read response body: %v", err)
+			_, _ = w.Write([]byte("proxy read error: " + err.Error()))
 			return
 		}
 
@@ -1102,6 +1129,7 @@ func (s *ProxyServer) proxyAPI(w http.ResponseWriter, r *http.Request, provider,
 		log.Printf("Database insertion error: %v", dbErr)
 	} else if insertID > 0 && len(logRecord.Response.ToolCalls) > 0 {
 		s.suspMu.Lock()
+		s.pruneExpiredSuspendedTools(time.Now())
 		for _, tc := range logRecord.Response.ToolCalls {
 			s.suspendedTools = append(s.suspendedTools, SuspendedTool{
 				LogID:             insertID,
@@ -1417,10 +1445,14 @@ func (s *ProxyServer) matchHistory(provider, clientFingerprint string, prompt []
 			var pMsgs []ChatMessage
 			var rMsg ChatMessage
 			if logRecord.PromptJSON != "" {
-				_ = json.Unmarshal([]byte(logRecord.PromptJSON), &pMsgs)
+				if err := json.Unmarshal([]byte(logRecord.PromptJSON), &pMsgs); err != nil {
+					log.Printf("matchHistory: failed to unmarshal prompt_json for log %d: %v", logRecord.ID, err)
+				}
 			}
 			if logRecord.ResponseJSON != "" {
-				_ = json.Unmarshal([]byte(logRecord.ResponseJSON), &rMsg)
+				if err := json.Unmarshal([]byte(logRecord.ResponseJSON), &rMsg); err != nil {
+					log.Printf("matchHistory: failed to unmarshal response_json for log %d: %v", logRecord.ID, err)
+				}
 			}
 			fullHistory := append(pMsgs, rMsg)
 
@@ -1463,10 +1495,14 @@ func (s *ProxyServer) matchHistory(provider, clientFingerprint string, prompt []
 			var pMsgs []ChatMessage
 			var rMsg ChatMessage
 			if logRecord.PromptJSON != "" {
-				_ = json.Unmarshal([]byte(logRecord.PromptJSON), &pMsgs)
+				if err := json.Unmarshal([]byte(logRecord.PromptJSON), &pMsgs); err != nil {
+					log.Printf("matchHistory(fuzzy): failed to unmarshal prompt_json for log %d: %v", logRecord.ID, err)
+				}
 			}
 			if logRecord.ResponseJSON != "" {
-				_ = json.Unmarshal([]byte(logRecord.ResponseJSON), &rMsg)
+				if err := json.Unmarshal([]byte(logRecord.ResponseJSON), &rMsg); err != nil {
+					log.Printf("matchHistory(fuzzy): failed to unmarshal response_json for log %d: %v", logRecord.ID, err)
+				}
 			}
 			fullHistory := append(pMsgs, rMsg)
 
@@ -1573,14 +1609,7 @@ func (s *ProxyServer) resolveSessionAndParent(r *http.Request, provider string, 
 
 	if isCold && userCount <= 1 {
 		s.suspMu.Lock()
-		now := time.Now()
-		var activeSuspended []SuspendedTool
-		for _, st := range s.suspendedTools {
-			if now.Sub(st.CreatedAt) < 180*time.Second {
-				activeSuspended = append(activeSuspended, st)
-			}
-		}
-		s.suspendedTools = activeSuspended
+		s.pruneExpiredSuspendedTools(time.Now())
 
 		promptText := extractPrimaryUserPrompt(prompt)
 
@@ -1602,6 +1631,10 @@ func (s *ProxyServer) resolveSessionAndParent(r *http.Request, provider string, 
 			if matchedIndex != -1 && bestScore >= 0.3 && (secondBestScore == 0 || bestScore >= secondBestScore+0.15) {
 				st := s.suspendedTools[matchedIndex]
 				s.suspendedTools = append(s.suspendedTools[:matchedIndex], s.suspendedTools[matchedIndex+1:]...)
+				// 清零底层数组尾部残留引用，避免 GC 无法回收
+				s.suspendedTools = s.suspendedTools[:len(s.suspendedTools)+1]
+				s.suspendedTools[len(s.suspendedTools)-1] = SuspendedTool{}
+				s.suspendedTools = s.suspendedTools[:len(s.suspendedTools)-1]
 				s.suspMu.Unlock()
 
 				sessionID := st.SessionID
@@ -1646,11 +1679,4 @@ func joinUpstreamURL(baseURL, pathSuffix string) string {
 	}
 
 	return baseURL + "/" + pathSuffix
-}
-
-func truncateString(s string, max int) string {
-	if len(s) <= max {
-		return s
-	}
-	return s[:max] + "..."
 }
