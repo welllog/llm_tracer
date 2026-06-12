@@ -446,6 +446,24 @@ func onExit() {
 }
 
 func main() {
+	// 初始化系统运行日志重定向
+	appDir := getAppDir()
+	logFilePath := filepath.Join(appDir, "system.log")
+
+	// 限制日志文件大小在 5MB 以内
+	if info, err := os.Stat(logFilePath); err == nil && info.Size() > 5*1024*1024 {
+		_ = os.WriteFile(logFilePath, []byte(fmt.Sprintf("--- system log rotated at %s due to size limit ---\n", time.Now().Format("2006-01-02 15:04:05"))), 0644)
+	}
+
+	logFile, err := os.OpenFile(logFilePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	if err == nil {
+		// 同时输出到标准错误流和本地日志文件
+		mw := io.MultiWriter(os.Stderr, logFile)
+		log.SetOutput(mw)
+	} else {
+		log.Printf("Failed to open system log file: %v", err)
+	}
+
 	// 允许用户在命令行设置监听地址
 	addrFlag := flag.String("listen", "", "override proxy listen address")
 	consoleFlag := flag.String("console", ":56129", "override console listen address")
@@ -519,6 +537,8 @@ func main() {
 	consoleMux.HandleFunc("GET /api/stats", server.handleGetStats)
 	consoleMux.HandleFunc("DELETE /api/logs/{id}", server.handleDeleteLog)
 	consoleMux.HandleFunc("DELETE /api/sessions/{id}/logs", server.handleDeleteSessionLogs)
+	consoleMux.HandleFunc("GET /api/system-logs", server.handleGetSystemLogs)
+	consoleMux.HandleFunc("POST /api/system-logs/clear", server.handleClearSystemLogs)
 
 	// 静态前端路由
 	var staticHandler http.Handler
@@ -731,6 +751,67 @@ func (s *ProxyServer) handleDeleteSessionLogs(w http.ResponseWriter, r *http.Req
 
 	if err := s.db.DeleteSessionLogs(sessionID); err != nil {
 		http.Error(w, fmt.Sprintf("delete session logs: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`{"status":"ok"}`))
+}
+
+func (s *ProxyServer) handleGetSystemLogs(w http.ResponseWriter, r *http.Request) {
+	logFilePath := filepath.Join(getAppDir(), "system.log")
+	file, err := os.Open(logFilePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("--- system log file not found ---\n"))
+			return
+		}
+		http.Error(w, fmt.Sprintf("failed to open log file: %v", err), http.StatusInternalServerError)
+		return
+	}
+	defer file.Close()
+
+	stat, err := file.Stat()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to stat log file: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	var content []byte
+	maxBytes := int64(100 * 1024) // 限制返回最后 100KB
+	if stat.Size() <= maxBytes {
+		content, err = io.ReadAll(file)
+	} else {
+		_, err = file.Seek(stat.Size()-maxBytes, io.SeekStart)
+		if err == nil {
+			content, err = io.ReadAll(file)
+			// 寻求位置可能在某行中间，跳过第一行以保持日志行完整
+			if err == nil && len(content) > 0 {
+				if idx := bytes.IndexByte(content, '\n'); idx != -1 && idx < len(content)-1 {
+					content = content[idx+1:]
+				}
+			}
+		}
+	}
+
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to read log file: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(content)
+}
+
+func (s *ProxyServer) handleClearSystemLogs(w http.ResponseWriter, r *http.Request) {
+	logFilePath := filepath.Join(getAppDir(), "system.log")
+	err := os.WriteFile(logFilePath, []byte("--- system log cleared ---\n"), 0644)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to clear log file: %v", err), http.StatusInternalServerError)
 		return
 	}
 

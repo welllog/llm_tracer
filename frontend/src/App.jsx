@@ -442,6 +442,13 @@ export default function App() {
   const [copiedText, setCopiedText] = useState("");
   const [activeTab, setActiveTab] = useState("trace"); // trace, prompt, raw_req, raw_resp
 
+  // 系统日志相关的状态
+  const [isSystemLogsOpen, setIsSystemLogsOpen] = useState(false);
+  const [systemLogs, setSystemLogs] = useState("");
+  const [isSystemLogsLoading, setIsSystemLogsLoading] = useState(false);
+  const [autoScroll, setAutoScroll] = useState(true);
+  const logsContainerRef = useRef(null);
+
   // 折叠状态控制
   const [showSystemPrompt, setShowSystemPrompt] = useState(false);
   const [showToolsDef, setShowToolsDef] = useState(false);
@@ -752,6 +759,63 @@ export default function App() {
       setIsConfigSaving(false);
     }
   };
+
+  // 获取系统运行日志
+  const fetchSystemLogs = useCallback(async () => {
+    setIsSystemLogsLoading(true);
+    try {
+      const res = await fetch("/api/system-logs");
+      if (res.ok) {
+        const text = await res.text();
+        setSystemLogs(text);
+      }
+    } catch (err) {
+      console.error("Failed to fetch system logs:", err);
+    } finally {
+      setIsSystemLogsLoading(false);
+    }
+  }, []);
+
+  // 清空系统运行日志
+  const handleClearSystemLogs = async () => {
+    if (!window.confirm("确定要物理清空系统运行日志文件吗？该操作将重置本地 system.log 文件。")) {
+      return;
+    }
+    try {
+      const res = await fetch("/api/system-logs/clear", {
+        method: "POST",
+      });
+      if (res.ok) {
+        setSystemLogs("--- system log cleared ---\n");
+      } else {
+        alert("清空系统日志失败");
+      }
+    } catch (err) {
+      console.error("Failed to clear system logs:", err);
+      alert("清空系统日志发生异常");
+    }
+  };
+
+  // 仅在系统日志模态框打开时进行 2.5 秒的轮询，并在关闭或卸载时销毁
+  useEffect(() => {
+    let timer = null;
+    if (isSystemLogsOpen) {
+      fetchSystemLogs();
+      timer = setInterval(fetchSystemLogs, 2500);
+    }
+    return () => {
+      if (timer) {
+        clearInterval(timer);
+      }
+    };
+  }, [isSystemLogsOpen, fetchSystemLogs]);
+
+  // 控制系统日志终端滚屏到最下方
+  useEffect(() => {
+    if (autoScroll && logsContainerRef.current) {
+      logsContainerRef.current.scrollTop = logsContainerRef.current.scrollHeight;
+    }
+  }, [systemLogs, autoScroll]);
 
   // ==========================================
   // 生命周期副作用
@@ -1681,6 +1745,14 @@ export default function App() {
           </button>
 
           <button
+            onClick={() => setIsSystemLogsOpen(true)}
+            className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-slate-900/50 hover:bg-slate-800/40 border border-slate-800/80 hover:border-cyan-500/50 hover:text-cyan-400 text-sm font-semibold transition-all active:scale-95 btn-glow-cyan"
+          >
+            <IconTerminal />
+            <span>系统日志</span>
+          </button>
+
+          <button
             onClick={() => setIsSettingsOpen(true)}
             className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-slate-900/50 hover:bg-slate-800/40 border border-slate-800/80 hover:border-cyan-500/50 hover:text-cyan-400 text-sm font-semibold transition-all active:scale-95 btn-glow-cyan"
           >
@@ -2589,6 +2661,85 @@ export default function App() {
           )}
         </section>
       </main>
+
+      {/* ==========================================
+          System Logs Modal 系统运行日志查看器 (终端质感)
+         ========================================== */}
+      {isSystemLogsOpen && (
+        <div className="fixed inset-0 bg-slate-950/70 z-50 flex items-center justify-center p-4 modal-fade-in">
+          <div className="glass-panel w-full max-w-4xl h-[80vh] overflow-hidden flex flex-col border border-slate-800/85 shadow-[0_20px_50px_rgba(0,0,0,0.85)] modal-scale-up">
+            <div className="flex justify-between items-center px-5 py-4 border-b border-slate-900 shrink-0">
+              <h2 className="text-base font-bold text-slate-100 flex items-center gap-2">
+                <IconTerminal />
+                <span>系统运行日志</span>
+                {isSystemLogsLoading && (
+                  <span className="flex items-center ml-1">
+                    <IconRefresh className="animate-spin text-cyan-400 w-3.5 h-3.5" />
+                  </span>
+                )}
+              </h2>
+              <button
+                onClick={() => setIsSystemLogsOpen(false)}
+                className="text-slate-450 hover:text-slate-200 text-2xl font-light transition-colors active:scale-95 leading-none"
+              >
+                &times;
+              </button>
+            </div>
+
+            {/* 控制面板 */}
+            <div className="flex flex-wrap items-center justify-between gap-3 px-5 py-3 bg-slate-950/30 border-b border-slate-900/60 shrink-0 text-xs">
+              <div className="flex items-center gap-4">
+                <button
+                  onClick={fetchSystemLogs}
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900/60 hover:bg-slate-800/40 border border-slate-800/80 hover:border-cyan-500/50 hover:text-cyan-400 transition-all active:scale-95"
+                >
+                  <IconRefresh className={isSystemLogsLoading ? "animate-spin" : ""} />
+                  <span>刷新</span>
+                </button>
+                <button
+                  onClick={handleClearSystemLogs}
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-red-950/20 hover:bg-red-950/40 border border-red-900/30 text-red-400 hover:text-red-300 transition-all active:scale-95"
+                >
+                  <IconTrash />
+                  <span>清空日志</span>
+                </button>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <label className="flex items-center gap-2 cursor-pointer text-slate-400 hover:text-slate-200 select-none">
+                  <input
+                    type="checkbox"
+                    checked={autoScroll}
+                    onChange={(e) => setAutoScroll(e.target.checked)}
+                    className="accent-cyan-500 cursor-pointer rounded"
+                  />
+                  <span>自动滚动到底部</span>
+                </label>
+              </div>
+            </div>
+
+            {/* 终端日志展示区 */}
+            <div
+              ref={logsContainerRef}
+              className="flex-1 p-5 overflow-y-auto bg-black/85 code-font text-xs text-slate-350 leading-relaxed scroll-isolated whitespace-pre-wrap select-text"
+            >
+              {systemLogs ? (
+                systemLogs
+              ) : (
+                <div className="text-slate-600 text-center py-20">暂无系统运行日志记录</div>
+              )}
+            </div>
+
+            <div className="px-5 py-3.5 border-t border-slate-900 bg-slate-950/40 flex justify-between items-center text-[10px] text-slate-500 shrink-0 font-sans">
+              <span>日志保存于 ~/.llm_tracer/system.log (仅返回最新 100KB)</span>
+              <span className="flex items-center gap-1.5">
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                <span>实时接收中 (每2.5秒更新)</span>
+              </span>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ==========================================
           Settings Modal 配置模态框 (极光玻璃态悬浮窗)
