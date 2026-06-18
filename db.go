@@ -125,7 +125,10 @@ func InitDB(dbPath string) (*DBManager, error) {
 	// 设置 SQLite 的一些性能优化选项
 	_, _ = db.Exec("PRAGMA journal_mode=WAL;")
 	_, _ = db.Exec("PRAGMA synchronous=NORMAL;")
-	_, _ = db.Exec("PRAGMA busy_timeout = 5000;")
+	// 提高忙等待上限，缓解并发写事务下的 "database is locked" 错误
+	_, _ = db.Exec("PRAGMA busy_timeout = 15000;")
+	// 写连接串行化，避免多写事务并发触发锁竞争；读连接不受限（WAL 下读不阻塞写）
+	db.SetMaxOpenConns(1)
 
 	mgr := &DBManager{db: db}
 	if err := mgr.createTables(); err != nil {
@@ -1045,22 +1048,34 @@ func (mgr *DBManager) GetSessions(page, pageSize int, keyword string) ([]Session
 	}
 	defer rows.Close()
 
-	var sessions []SessionMetadata
+	type rawSession struct {
+		SessionMetadata
+		firstID int64
+	}
+	var raws []rawSession
 	for rows.Next() {
 		var s SessionMetadata
-		var firstID, lastID int64
+		var firstID, discardLastID int64
 		err := rows.Scan(
-			&s.SessionID, &firstID, &lastID, &s.StartTime, &s.EndTime,
+			&s.SessionID, &firstID, &discardLastID, &s.StartTime, &s.EndTime,
 			&s.TotalTokens, &s.MessageCount, &s.Model, &s.Provider,
 		)
 		if err != nil {
 			return nil, 0, err
 		}
+		raws = append(raws, rawSession{SessionMetadata: s, firstID: firstID})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+	rows.Close()
 
-		// 获取摘要 (尝试寻找有意义的提问)
+	// 必须在 rows 关闭后再查摘要，否则 SetMaxOpenConns(1) 会死锁
+	for i := range raws {
+		s := &raws[i]
 		if strings.HasPrefix(s.SessionID, "standalone-") {
 			var promptStr string
-			err = mgr.db.QueryRow("SELECT prompt_json FROM logs WHERE id = ?", firstID).Scan(&promptStr)
+			err = mgr.db.QueryRow("SELECT prompt_json FROM logs WHERE id = ?", s.firstID).Scan(&promptStr)
 			if err == nil && promptStr != "" {
 				var msgs []ChatMessage
 				if json.Unmarshal([]byte(promptStr), &msgs) == nil {
@@ -1088,10 +1103,12 @@ func (mgr *DBManager) GetSessions(page, pageSize int, keyword string) ([]Session
 				subRows.Close()
 			}
 		}
-
-		sessions = append(sessions, s)
 	}
 
+	sessions := make([]SessionMetadata, len(raws))
+	for i, r := range raws {
+		sessions[i] = r.SessionMetadata
+	}
 	return sessions, total, nil
 }
 

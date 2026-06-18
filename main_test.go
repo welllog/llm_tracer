@@ -435,33 +435,48 @@ func TestJoinUpstreamURL(t *testing.T) {
 	}{
 		{
 			baseURL:    "https://api.openai.com",
-			pathSuffix: "/v1/chat/completions",
-			expected:   "https://api.openai.com/v1/chat/completions",
+			pathSuffix: "/chat/completions",
+			expected:   "https://api.openai.com/chat/completions",
 		},
 		{
 			baseURL:    "https://api.openai.com/v1",
-			pathSuffix: "/v1/chat/completions",
+			pathSuffix: "/chat/completions",
 			expected:   "https://api.openai.com/v1/chat/completions",
 		},
 		{
 			baseURL:    "https://api.openai.com/v1/",
-			pathSuffix: "/v1/chat/completions",
+			pathSuffix: "/chat/completions",
 			expected:   "https://api.openai.com/v1/chat/completions",
 		},
 		{
 			baseURL:    "https://my-proxy.com/custom/v1",
-			pathSuffix: "/v1/chat/completions",
+			pathSuffix: "/chat/completions",
 			expected:   "https://my-proxy.com/custom/v1/chat/completions",
 		},
 		{
 			baseURL:    "https://api.anthropic.com",
-			pathSuffix: "/v1/messages",
-			expected:   "https://api.anthropic.com/v1/messages",
+			pathSuffix: "/messages",
+			expected:   "https://api.anthropic.com/messages",
 		},
 		{
 			baseURL:    "https://api.anthropic.com/v1",
-			pathSuffix: "/v1/messages",
+			pathSuffix: "/messages",
 			expected:   "https://api.anthropic.com/v1/messages",
+		},
+		{
+			baseURL:    "https://ark.cn-beijing.volces.com/api/coding/v3",
+			pathSuffix: "/chat/completions",
+			expected:   "https://ark.cn-beijing.volces.com/api/coding/v3/chat/completions",
+		},
+		{
+			baseURL:    "https://ark.cn-beijing.volces.com/api/coding/v3/",
+			pathSuffix: "/chat/completions",
+			expected:   "https://ark.cn-beijing.volces.com/api/coding/v3/chat/completions",
+		},
+		{
+			baseURL:    "https://ark.cn-beijing.volces.com/api/coding/v3",
+			pathSuffix: "/responses",
+			expected:   "https://ark.cn-beijing.volces.com/api/coding/v3/responses",
 		},
 	}
 

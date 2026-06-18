@@ -293,8 +293,12 @@ function joinUpstreamURL(baseURL, pathSuffix) {
     suffix = suffix.slice(1);
   }
 
-  if (base.endsWith("/v1") && suffix.startsWith("v1/")) {
-    suffix = suffix.slice(3); // 剔除首部的 "v1/"
+  const baseSeg = base.split("/").pop() || "";
+  const pathSeg = suffix.split("/")[0] || "";
+
+  const isVersion = (s) => s.length >= 2 && s[0] === "v" && /^\d/.test(s[1]);
+  if (isVersion(baseSeg) && isVersion(pathSeg)) {
+    suffix = suffix.slice(pathSeg.length + 1);
   }
 
   return base + "/" + suffix;
@@ -854,13 +858,20 @@ export default function App() {
   // 仅在系统日志模态框打开时进行 2.5 秒的轮询，并在关闭或卸载时销毁
   useEffect(() => {
     let timer = null;
+    let cancelled = false;
     if (isSystemLogsOpen) {
-      fetchSystemLogs();
-      timer = setInterval(fetchSystemLogs, 2500);
+      const loop = async () => {
+        await fetchSystemLogs();
+        if (!cancelled) {
+          timer = setTimeout(loop, 2500);
+        }
+      };
+      loop();
     }
     return () => {
+      cancelled = true;
       if (timer) {
-        clearInterval(timer);
+        clearTimeout(timer);
       }
     };
   }, [isSystemLogsOpen, fetchSystemLogs]);
@@ -906,25 +917,34 @@ export default function App() {
     setSessionLogs([]);
   }, [viewMode, fetchLogs, fetchSessions]);
 
-  // 轮询更新列表和用量统计（每 5 秒一次）
+  // 轮询更新列表和用量统计（接口返回后再延迟 5 秒）
   useEffect(() => {
-    autoRefreshTimer.current = setInterval(() => {
+    let cancelled = false;
+
+    const loop = async () => {
       // 仅在第一页且没有搜索过滤时自动刷新列表
       if (viewMode === "logs") {
         if (currentPage === 1 && searchKeyword.trim() === "") {
-          fetchLogs(1);
+          await fetchLogs(1);
         }
       } else {
         if (currentSessionPage === 1 && searchKeyword.trim() === "") {
-          fetchSessions(1);
+          await fetchSessions(1);
         }
       }
-      fetchStats();
-    }, 5000);
+      await fetchStats();
+
+      if (!cancelled) {
+        autoRefreshTimer.current = setTimeout(loop, 5000);
+      }
+    };
+
+    autoRefreshTimer.current = setTimeout(loop, 5000);
 
     return () => {
+      cancelled = true;
       if (autoRefreshTimer.current) {
-        clearInterval(autoRefreshTimer.current);
+        clearTimeout(autoRefreshTimer.current);
       }
     };
   }, [
@@ -3213,7 +3233,7 @@ export default function App() {
                       <span className="text-emerald-400/90 break-all">
                         {joinUpstreamURL(
                           config.openaiBaseURL,
-                          "/v1/chat/completions",
+                          "/chat/completions",
                         ) || "(未配置上游地址)"}
                       </span>
                     </div>
@@ -3222,7 +3242,7 @@ export default function App() {
                       <span className="text-emerald-400/90 break-all">
                         {joinUpstreamURL(
                           config.openaiResponsesBaseURL || config.openaiBaseURL,
-                          "/v1/responses",
+                          "/responses",
                         ) || "(未配置上游地址)"}
                       </span>
                     </div>
@@ -3361,7 +3381,7 @@ export default function App() {
                       <span className="text-emerald-400/90 break-all">
                         {joinUpstreamURL(
                           config.anthropicBaseURL,
-                          "/v1/messages",
+                          "/messages",
                         ) || "(未配置上游地址)"}
                       </span>
                     </div>

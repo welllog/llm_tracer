@@ -59,6 +59,8 @@ type ProxyServer struct {
 	activeMu             sync.RWMutex
 	suspendedTools       []SuspendedTool
 	suspMu               sync.Mutex
+	logQueue             chan *UnifiedLog
+	logQueueOnce         sync.Once
 }
 
 type SuspendedTool struct {
@@ -74,6 +76,63 @@ type SuspendedTool struct {
 
 const suspendedToolTTL = 1800 * time.Second // 30 分钟
 const suspendedToolMaxCap = 500
+
+// logQueueCap 控制异步写库队列容量；超出时丢弃最旧日志并告警，避免内存暴涨
+const logQueueCap = 256
+
+// startLogWriter 启动单写 goroutine 串行消费日志队列，避免并发写事务竞争 SQLite
+func (s *ProxyServer) startLogWriter() {
+	s.logQueueOnce.Do(func() {
+		s.logQueue = make(chan *UnifiedLog, logQueueCap)
+		go s.logWriterLoop()
+	})
+}
+
+func (s *ProxyServer) logWriterLoop() {
+	for logRecord := range s.logQueue {
+		s.insertLogAndSuspend(logRecord)
+	}
+}
+
+// insertLogAndSuspend 执行实际的 DB 写入并登记 suspended tool calls
+func (s *ProxyServer) insertLogAndSuspend(logRecord *UnifiedLog) {
+	insertID, dbErr := s.db.InsertLog(logRecord)
+	if dbErr != nil {
+		log.Printf("Database insertion error: %v", dbErr)
+		return
+	}
+	if insertID > 0 && len(logRecord.Response.ToolCalls) > 0 {
+		s.suspMu.Lock()
+		s.pruneExpiredSuspendedTools(time.Now())
+		for _, tc := range logRecord.Response.ToolCalls {
+			s.suspendedTools = append(s.suspendedTools, SuspendedTool{
+				LogID:             insertID,
+				SessionID:         logRecord.SessionID,
+				ToolCallID:        tc.ID,
+				Arguments:         tc.Arguments,
+				Provider:          logRecord.Provider,
+				ToolName:          tc.Name,
+				ClientFingerprint: logRecord.ClientFingerprint,
+				CreatedAt:         time.Now(),
+			})
+		}
+		s.suspMu.Unlock()
+	}
+}
+
+// enqueueLog 非阻塞投递日志；队列满时丢弃并告警，绝不阻塞代理请求。
+// 若异步 worker 未启动（如测试场景 logQueue 为 nil），则退化为同步写入。
+func (s *ProxyServer) enqueueLog(logRecord *UnifiedLog) {
+	if s.logQueue == nil {
+		s.insertLogAndSuspend(logRecord)
+		return
+	}
+	select {
+	case s.logQueue <- logRecord:
+	default:
+		log.Printf("log queue full (cap=%d), dropping log for session %s", logQueueCap, logRecord.SessionID)
+	}
+}
 
 func (s *ProxyServer) pruneExpiredSuspendedTools(now time.Time) {
 	cutoff := now.Add(-suspendedToolTTL)
@@ -493,7 +552,8 @@ func main() {
 
 	server := &ProxyServer{
 		client: &http.Client{
-			Timeout: 180 * time.Second,
+			// 不设置 Client.Timeout：它会覆盖整个请求-响应周期（含流式 body 读取），
+			// 导致长对话/长代码生成的流式响应被强制中断。改在 Transport 层控制各阶段超时。
 			Transport: &http.Transport{
 				Proxy:               http.ProxyFromEnvironment,
 				DialContext:         (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
@@ -501,6 +561,8 @@ func main() {
 				MaxIdleConns:        100,
 				IdleConnTimeout:     90 * time.Second,
 				TLSHandshakeTimeout: 10 * time.Second,
+				// 上游迟迟不返回响应头时及时失败，避免无限等待
+				ResponseHeaderTimeout: 60 * time.Second,
 			},
 		},
 		lastActiveSessionMap: make(map[string]string),
@@ -535,6 +597,9 @@ func main() {
 		log.Fatalf("failed to initialize SQLite: %v", err)
 	}
 	server.db = dbMgr
+
+	// 启动异步日志写入 worker（单写 goroutine 串行写库，避免并发写事务竞争）
+	server.startLogWriter()
 
 	// 1. 启动代理服务
 	if err := server.startProxyService(); err != nil {
@@ -890,7 +955,7 @@ func (s *ProxyServer) handleProxyOpenAI(w http.ResponseWriter, r *http.Request) 
 	apiKey := s.config.OpenaiAPIKey
 	s.configLock.RUnlock()
 
-	s.proxyAPI(w, r, "openai", upstreamURL, "/v1/chat/completions", apiKey)
+	s.proxyAPI(w, r, "openai", upstreamURL, "/chat/completions", apiKey)
 }
 
 func (s *ProxyServer) handleProxyOpenAIResponses(w http.ResponseWriter, r *http.Request) {
@@ -906,7 +971,7 @@ func (s *ProxyServer) handleProxyOpenAIResponses(w http.ResponseWriter, r *http.
 	}
 	s.configLock.RUnlock()
 
-	s.proxyAPI(w, r, "openai-responses", upstreamURL, "/v1/responses", apiKey)
+	s.proxyAPI(w, r, "openai-responses", upstreamURL, "/responses", apiKey)
 }
 
 func (s *ProxyServer) handleProxyAnthropic(w http.ResponseWriter, r *http.Request) {
@@ -915,7 +980,7 @@ func (s *ProxyServer) handleProxyAnthropic(w http.ResponseWriter, r *http.Reques
 	apiKey := s.config.AnthropicAPIKey
 	s.configLock.RUnlock()
 
-	s.proxyAPI(w, r, "anthropic", upstreamURL, "/v1/messages", apiKey)
+	s.proxyAPI(w, r, "anthropic", upstreamURL, "/messages", apiKey)
 }
 
 func (s *ProxyServer) proxyAPI(w http.ResponseWriter, r *http.Request, provider, upstreamBaseURL, pathSuffix, apiKey string) {
@@ -957,6 +1022,15 @@ func (s *ProxyServer) proxyAPI(w http.ResponseWriter, r *http.Request, provider,
 	// 复制头信息并剔除特定代理字段
 	for key, values := range r.Header {
 		if strings.EqualFold(key, "Connection") || strings.EqualFold(key, "Authorization") || strings.EqualFold(key, "X-Api-Key") {
+			continue
+		}
+		// 剔除 Accept-Encoding：代理仅支持 gzip/deflate 解压，若客户端要求 br 等编码，
+		// 上游返回后代理无法解压会导致日志解析拿到乱码；让上游返回明文即可正常解析与转发。
+		if strings.EqualFold(key, "Accept-Encoding") {
+			continue
+		}
+		// 剔除 Host：由 http.Client 依据 targetURL 自动设置，避免透传客户端的 Host
+		if strings.EqualFold(key, "Host") {
 			continue
 		}
 		for _, value := range values {
@@ -1124,26 +1198,8 @@ func (s *ProxyServer) proxyAPI(w http.ResponseWriter, r *http.Request, provider,
 
 	// 如果在上游没抓到 usage，保持 0 而不是编造数字，避免污染统计数据
 
-	insertID, dbErr := s.db.InsertLog(logRecord)
-	if dbErr != nil {
-		log.Printf("Database insertion error: %v", dbErr)
-	} else if insertID > 0 && len(logRecord.Response.ToolCalls) > 0 {
-		s.suspMu.Lock()
-		s.pruneExpiredSuspendedTools(time.Now())
-		for _, tc := range logRecord.Response.ToolCalls {
-			s.suspendedTools = append(s.suspendedTools, SuspendedTool{
-				LogID:             insertID,
-				SessionID:         logRecord.SessionID,
-				ToolCallID:        tc.ID,
-				Arguments:         tc.Arguments,
-				Provider:          logRecord.Provider,
-				ToolName:          tc.Name,
-				ClientFingerprint: clientFingerprint,
-				CreatedAt:         time.Now(),
-			})
-		}
-		s.suspMu.Unlock()
-	}
+	// 异步写入数据库，避免写事务阻塞代理请求
+	s.enqueueLog(logRecord)
 }
 
 func (s *ProxyServer) logErrorExchange(provider, model, path string, reqBody []byte, err error, duration time.Duration, sessionID string, parentID *int64, parentToolCallID, clientFingerprint string) {
@@ -1173,7 +1229,7 @@ func (s *ProxyServer) logErrorExchange(provider, model, path string, reqBody []b
 		ClientFingerprint: clientFingerprint,
 		RequestHandles:   requestInfo.Handles,
 	}
-	_, _ = s.db.InsertLog(logRecord)
+	s.enqueueLog(logRecord)
 }
 
 func generateUUID() string {
@@ -1544,19 +1600,36 @@ func (s *ProxyServer) matchHistory(provider, clientFingerprint string, prompt []
 	return "", nil, false
 }
 
-func (s *ProxyServer) resolveSessionAndParent(r *http.Request, provider string, prompt []ChatMessage, handles []ConversationHandle, hints map[string]string) (string, *int64, string, string) {
+// rememberActiveSession 记录客户端指纹对应的最近活跃会话，仅在访问 map 时持写锁
+func (s *ProxyServer) rememberActiveSession(clientFingerprint, sessionID string) {
+	if strings.TrimSpace(clientFingerprint) == "" || strings.TrimSpace(sessionID) == "" {
+		return
+	}
 	s.activeMu.Lock()
 	defer s.activeMu.Unlock()
-
 	if s.lastActiveSessionMap == nil {
 		s.lastActiveSessionMap = make(map[string]string)
 	}
+	s.lastActiveSessionMap[clientFingerprint] = sessionID
+}
+
+// getActiveSession 读取客户端指纹对应的最近活跃会话，仅在访问 map 时持读锁
+func (s *ProxyServer) getActiveSession(clientFingerprint string) string {
+	if strings.TrimSpace(clientFingerprint) == "" {
+		return ""
+	}
+	s.activeMu.RLock()
+	defer s.activeMu.RUnlock()
+	return s.lastActiveSessionMap[clientFingerprint]
+}
+
+func (s *ProxyServer) resolveSessionAndParent(r *http.Request, provider string, prompt []ChatMessage, handles []ConversationHandle, hints map[string]string) (string, *int64, string, string) {
+	// 注意：本函数不再持有 activeMu 全程写锁，仅在读写 lastActiveSessionMap 时短暂加锁，
+	// 避免耗时的 DB 查询与 matchHistory CPU 计算阻塞并发代理请求。
 
 	clientFingerprint := buildClientFingerprint(r, provider, hints)
 	rememberSession := func(sessionID string) {
-		if strings.TrimSpace(clientFingerprint) != "" && strings.TrimSpace(sessionID) != "" {
-			s.lastActiveSessionMap[clientFingerprint] = sessionID
-		}
+		s.rememberActiveSession(clientFingerprint, sessionID)
 	}
 
 	if stableHandle, ok := selectStableSessionHandle(handles); ok {
@@ -1652,7 +1725,7 @@ func (s *ProxyServer) resolveSessionAndParent(r *http.Request, provider string, 
 	}
 
 	if isSideTask(prompt) {
-		if sid, ok := s.lastActiveSessionMap[clientFingerprint]; ok && sid != "" {
+		if sid := s.getActiveSession(clientFingerprint); sid != "" {
 			return sid, nil, "", clientFingerprint
 		}
 		sid, _, err := s.db.GetLatestSessionByClientFingerprint(clientFingerprint)
@@ -1672,11 +1745,5 @@ func (s *ProxyServer) resolveSessionAndParent(r *http.Request, provider string, 
 func joinUpstreamURL(baseURL, pathSuffix string) string {
 	baseURL = strings.TrimSuffix(baseURL, "/")
 	pathSuffix = strings.TrimPrefix(pathSuffix, "/")
-
-	// 智能去重：如果 baseURL 以 "/v1" 结尾，且 pathSuffix 以 "v1/" 开头，则剔除 pathSuffix 的 "v1/"
-	if strings.HasSuffix(baseURL, "/v1") && strings.HasPrefix(pathSuffix, "v1/") {
-		pathSuffix = strings.TrimPrefix(pathSuffix, "v1/")
-	}
-
 	return baseURL + "/" + pathSuffix
 }
