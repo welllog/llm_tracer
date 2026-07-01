@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -37,15 +38,18 @@ import (
 //go:embed static/*
 var staticFS embed.FS
 
+var anthropicBillingHeaderRegex = regexp.MustCompile(`(?i)"x-anthropic-billing-header:[^"\\]*(?:\\n|\\r\\n)*`)
+
 type AppConfig struct {
-	ListenAddr             string `json:"listenAddr"`
-	OpenaiBaseURL          string `json:"openaiBaseURL"`
-	OpenaiAPIKey           string `json:"openaiAPIKey"`
-	OpenaiResponsesBaseURL string `json:"openaiResponsesBaseURL"`
-	OpenaiResponsesAPIKey  string `json:"openaiResponsesAPIKey"`
-	AnthropicBaseURL       string `json:"anthropicBaseURL"`
-	AnthropicAPIKey        string `json:"anthropicAPIKey"`
-	DBPath                 string `json:"dbPath"`
+	ListenAddr                   string `json:"listenAddr"`
+	OpenaiBaseURL                string `json:"openaiBaseURL"`
+	OpenaiAPIKey                 string `json:"openaiAPIKey"`
+	OpenaiResponsesBaseURL       string `json:"openaiResponsesBaseURL"`
+	OpenaiResponsesAPIKey        string `json:"openaiResponsesAPIKey"`
+	AnthropicBaseURL             string `json:"anthropicBaseURL"`
+	AnthropicAPIKey              string `json:"anthropicAPIKey"`
+	RemoveAnthropicBillingHeader bool   `json:"removeAnthropicBillingHeader"`
+	DBPath                       string `json:"dbPath"`
 }
 
 type ProxyServer struct {
@@ -64,14 +68,14 @@ type ProxyServer struct {
 }
 
 type SuspendedTool struct {
-	LogID      int64
-	SessionID  string
-	ToolCallID string
-	Arguments  string
-	Provider   string
-	ToolName   string
+	LogID             int64
+	SessionID         string
+	ToolCallID        string
+	Arguments         string
+	Provider          string
+	ToolName          string
 	ClientFingerprint string
-	CreatedAt  time.Time
+	CreatedAt         time.Time
 }
 
 const suspendedToolTTL = 1800 * time.Second // 30 分钟
@@ -266,6 +270,7 @@ func (s *ProxyServer) loadConfig() error {
 				s.config.AnthropicBaseURL = fileCfg.AnthropicBaseURL
 			}
 			s.config.AnthropicAPIKey = fileCfg.AnthropicAPIKey
+			s.config.RemoveAnthropicBillingHeader = fileCfg.RemoveAnthropicBillingHeader
 			if fileCfg.DBPath != "" {
 				s.config.DBPath = fileCfg.DBPath
 			}
@@ -287,6 +292,11 @@ func (s *ProxyServer) loadConfig() error {
 	}
 	if env := os.Getenv("ANTHROPIC_API_KEY"); env != "" {
 		s.config.AnthropicAPIKey = env
+	}
+	if env := os.Getenv("REMOVE_ANTHROPIC_BILLING_HEADER"); env != "" {
+		if parsed, err := strconv.ParseBool(env); err == nil {
+			s.config.RemoveAnthropicBillingHeader = parsed
+		}
 	}
 	if env := os.Getenv("DB_PATH"); env != "" {
 		s.config.DBPath = env
@@ -983,6 +993,108 @@ func (s *ProxyServer) handleProxyAnthropic(w http.ResponseWriter, r *http.Reques
 	s.proxyAPI(w, r, "anthropic", upstreamURL, "/messages", apiKey)
 }
 
+func containsCaseInsensitive(b []byte, substr string) bool {
+	if len(substr) == 0 {
+		return true
+	}
+	if len(b) < len(substr) {
+		return false
+	}
+
+	lowerSubstr := strings.ToLower(substr)
+	firstLower := lowerSubstr[0]
+	firstUpper := byte(unicode.ToUpper(rune(firstLower)))
+
+	for i := 0; i <= len(b)-len(lowerSubstr); i++ {
+		if b[i] == firstLower || b[i] == firstUpper {
+			match := true
+			for j := 1; j < len(lowerSubstr); j++ {
+				charB := b[i+j]
+				charS := lowerSubstr[j]
+				if charB != charS && charB != byte(unicode.ToUpper(rune(charS))) {
+					match = false
+					break
+				}
+			}
+			if match {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// findSystemFieldRange 寻找顶层 "system" 字段值的起始和结束偏移量
+func findSystemFieldRange(data []byte) (start, end int) {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	// 进过顶层对象开始符 '{'
+	t, err := dec.Token()
+	if err != nil || t != json.Delim('{') {
+		return -1, -1
+	}
+
+	for dec.More() {
+		t, err := dec.Token()
+		if err != nil {
+			break
+		}
+		if key, ok := t.(string); ok && key == "system" {
+			// json.Decoder 并没有直接返回当前 token 结束位置的接口，
+			// 但我们可以通过 Buffered 获取当前读取到的位置。
+			// 这里使用一个小技巧：记录当前已读偏移量，然后 Decode 一个原始值。
+			startPos := int(dec.InputOffset())
+			var raw json.RawMessage
+			if err := dec.Decode(&raw); err == nil {
+				endPos := int(dec.InputOffset())
+				// 这里的 startPos 到 endPos 精确包裹了 system 的 value 字节流
+				return startPos, endPos
+			}
+			break
+		}
+		// 跳过不需要处理的字段值
+		var skip json.RawMessage
+		_ = dec.Decode(&skip)
+	}
+	return -1, -1
+}
+
+func sanitizeAnthropicMessagesRequest(reqBody []byte, enabled bool) ([]byte, bool) {
+	if !enabled || len(reqBody) == 0 {
+		return reqBody, false
+	}
+
+	// 1. 快速预检
+	if !containsCaseInsensitive(reqBody, "x-anthropic-billing-header:") {
+		return reqBody, false
+	}
+
+	// 2. 定位 system 字段值的偏移量，确保不破坏原始 JSON 顺序和格式
+	start, end := findSystemFieldRange(reqBody)
+	if start == -1 || end > len(reqBody) {
+		return reqBody, false
+	}
+
+	// 3. 仅对该范围内的字节执行清洗
+	systemPart := reqBody[start:end]
+	changed := false
+	cleanedSystemPart := anthropicBillingHeaderRegex.ReplaceAllFunc(systemPart, func(match []byte) []byte {
+		changed = true
+		return []byte{'"'}
+	})
+
+	if !changed {
+		return reqBody, false
+	}
+
+	// 4. 原地拼接：绝对保留其余所有字段的原始顺序、空格和换行，确保 Prompt Cache 不失效
+	result := make([]byte, 0, len(reqBody)-(len(systemPart)-len(cleanedSystemPart)))
+	result = append(result, reqBody[:start]...)
+	result = append(result, cleanedSystemPart...)
+	result = append(result, reqBody[end:]...)
+
+	return result, true
+}
+
 func (s *ProxyServer) proxyAPI(w http.ResponseWriter, r *http.Request, provider, upstreamBaseURL, pathSuffix, apiKey string) {
 	startedAt := time.Now()
 
@@ -993,9 +1105,20 @@ func (s *ProxyServer) proxyAPI(w http.ResponseWriter, r *http.Request, provider,
 		return
 	}
 
+	// 2. 预处理 Anthropic /messages 的请求体
+	reqBodyToForward := reqBody
+	if provider == "anthropic" && strings.HasSuffix(pathSuffix, "/messages") {
+		s.configLock.RLock()
+		removeBillingHeader := s.config.RemoveAnthropicBillingHeader
+		s.configLock.RUnlock()
+		if sanitized, changed := sanitizeAnthropicMessagesRequest(reqBody, removeBillingHeader); changed {
+			reqBodyToForward = sanitized
+		}
+	}
+
 	// 2. 解析请求
 	requestInfo := RequestParseResult{Provider: provider}
-	parseResult, parseErr := ParseUnifiedRequestEnvelope(pathSuffix, reqBody)
+	parseResult, parseErr := ParseUnifiedRequestEnvelope(pathSuffix, reqBodyToForward)
 	if parseErr != nil {
 		log.Printf("Failed to parse request payload: %v", parseErr)
 	} else {
@@ -1013,7 +1136,7 @@ func (s *ProxyServer) proxyAPI(w http.ResponseWriter, r *http.Request, provider,
 
 	// 3. 构建上游请求
 	targetURL := joinUpstreamURL(upstreamBaseURL, pathSuffix)
-	upstreamReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, targetURL, bytes.NewReader(reqBody))
+	upstreamReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, targetURL, bytes.NewReader(reqBodyToForward))
 	if err != nil {
 		http.Error(w, "failed to create upstream request", http.StatusInternalServerError)
 		return
@@ -1186,7 +1309,7 @@ func (s *ProxyServer) proxyAPI(w http.ResponseWriter, r *http.Request, provider,
 		Prompt:              promptMsgs,
 		Response:            finalResponseMsg,
 		Tools:               tools,
-		RawRequest:          string(reqBody),
+		RawRequest:          string(reqBodyToForward),
 		RawResponse:         rawResponseBuffer.String(),
 		SessionID:           sessionID,
 		ParentID:            parentID,
@@ -1195,7 +1318,6 @@ func (s *ProxyServer) proxyAPI(w http.ResponseWriter, r *http.Request, provider,
 		RequestHandles:      requestInfo.Handles,
 		ResponseHandles:     responseHandles,
 	}
-
 	// 如果在上游没抓到 usage，保持 0 而不是编造数字，避免污染统计数据
 
 	// 异步写入数据库，避免写事务阻塞代理请求
@@ -1214,20 +1336,20 @@ func (s *ProxyServer) logErrorExchange(provider, model, path string, reqBody []b
 		}
 	}
 	logRecord := &UnifiedLog{
-		Provider:         provider,
-		Model:            model,
-		Path:             path,
-		StatusCode:       http.StatusBadGateway,
-		DurationMs:       duration.Milliseconds(),
-		Prompt:           requestInfo.Messages,
-		Tools:            requestInfo.Tools,
-		RawRequest:       string(reqBody),
-		ErrorMessage:     err.Error(),
-		SessionID:        sessionID,
-		ParentID:         parentID,
-		ParentToolCallID: parentToolCallID,
+		Provider:          provider,
+		Model:             model,
+		Path:              path,
+		StatusCode:        http.StatusBadGateway,
+		DurationMs:        duration.Milliseconds(),
+		Prompt:            requestInfo.Messages,
+		Tools:             requestInfo.Tools,
+		RawRequest:        string(reqBody),
+		ErrorMessage:      err.Error(),
+		SessionID:         sessionID,
+		ParentID:          parentID,
+		ParentToolCallID:  parentToolCallID,
 		ClientFingerprint: clientFingerprint,
-		RequestHandles:   requestInfo.Handles,
+		RequestHandles:    requestInfo.Handles,
 	}
 	s.enqueueLog(logRecord)
 }

@@ -458,6 +458,7 @@ export default function App() {
     openaiResponsesAPIKey: "",
     anthropicBaseURL: "",
     anthropicAPIKey: "",
+    removeAnthropicBillingHeader: false,
     dbPath: "",
   });
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
@@ -3352,6 +3353,35 @@ export default function App() {
                         {showAnthropicKey ? <IconEyeOff /> : <IconEye />}
                       </button>
                     </div>
+                  </div>
+                  <div className="rounded-xl border border-slate-900/70 bg-slate-950/35 p-3 flex items-start justify-between gap-3">
+                    <div className="flex flex-col gap-1.5">
+                      <label className="text-[10px] text-slate-550 font-bold">
+                        移除 Claude Code 的 billing header
+                      </label>
+                      <span className="text-[10px] text-slate-500 leading-relaxed">
+                        检测并移除提示词中的 x-anthropic-billing-header
+                        行，避免把 Claude Code 的专用标记转发给其它上游。
+                      </span>
+                    </div>
+                    <label className="flex items-center gap-2 cursor-pointer shrink-0">
+                      <input
+                        type="checkbox"
+                        checked={Boolean(config.removeAnthropicBillingHeader)}
+                        onChange={(e) =>
+                          setConfig({
+                            ...config,
+                            removeAnthropicBillingHeader: e.target.checked,
+                          })
+                        }
+                        className="accent-purple-500 h-4 w-4 rounded"
+                      />
+                      <span className="text-[10px] text-slate-300">
+                        {Boolean(config.removeAnthropicBillingHeader)
+                          ? "已启用"
+                          : "关闭"}
+                      </span>
+                    </label>
                   </div>
                   {/* 实时本地代理 URL 展示 */}
                   <div className="mt-1 px-3 py-2.5 bg-slate-950/40 border border-slate-900/60 rounded-xl flex flex-col gap-1 text-[10px] font-mono">

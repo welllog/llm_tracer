@@ -216,12 +216,12 @@ func TestProxyAndLogging(t *testing.T) {
 		client: http.DefaultClient,
 		db:     dbMgr,
 		config: AppConfig{
-			ListenAddr:             "127.0.0.1:0", // 随机端口
-			OpenaiBaseURL:          mockUpstream.URL,
-			OpenaiAPIKey:           "test-openai-key",
-			AnthropicBaseURL:       mockUpstream.URL,
-			AnthropicAPIKey:        "test-anthropic-key",
-			DBPath:                 dbPath,
+			ListenAddr:       "127.0.0.1:0", // 随机端口
+			OpenaiBaseURL:    mockUpstream.URL,
+			OpenaiAPIKey:     "test-openai-key",
+			AnthropicBaseURL: mockUpstream.URL,
+			AnthropicAPIKey:  "test-anthropic-key",
+			DBPath:           dbPath,
 		},
 		lastActiveSessionMap: make(map[string]string),
 	}
@@ -485,6 +485,132 @@ func TestJoinUpstreamURL(t *testing.T) {
 		if actual != tc.expected {
 			t.Errorf("joinUpstreamURL(%q, %q) = %q; want %q", tc.baseURL, tc.pathSuffix, actual, tc.expected)
 		}
+	}
+}
+
+func TestAnthropicProxyStripsBillingHeaderWhenConfigured(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "llm_tracer_strip_header_*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	dbPath := filepath.Join(tempDir, "test.db")
+	dbMgr, err := InitDB(dbPath)
+	if err != nil {
+		t.Fatalf("failed to init db: %v", err)
+	}
+	defer dbMgr.Close()
+
+	var upstreamRequestBody string
+	mockUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		bodyBytes, _ := io.ReadAll(r.Body)
+		upstreamRequestBody = string(bodyBytes)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{
+			"id": "msg_test",
+			"type": "message",
+			"role": "assistant",
+			"model": "claude-3-5-sonnet-latest",
+			"content": [{"type": "text", "text": "ok"}],
+			"usage": {"input_tokens": 1, "output_tokens": 1}
+		}`))
+	}))
+	defer mockUpstream.Close()
+
+	proxySrv := &ProxyServer{
+		client: http.DefaultClient,
+		db:     dbMgr,
+		config: AppConfig{
+			ListenAddr:                   "127.0.0.1:0",
+			AnthropicBaseURL:             mockUpstream.URL,
+			AnthropicAPIKey:              "test-anthropic-key",
+			RemoveAnthropicBillingHeader: true,
+			DBPath:                       dbPath,
+		},
+		lastActiveSessionMap: make(map[string]string),
+	}
+
+	// Test case 1: Header as the first field in an object within a system array
+	reqBody := []byte(`{
+		"model": "claude-3-5-sonnet-latest",
+		"max_tokens": 256,
+		"system": [
+			{
+				"type": "text",
+				"text": "x-anthropic-billing-header: cc_version=2.1.142.9fa; cc_entrypoint=cli; cch=97ccd;\nYou are Claude Code."
+			},
+			{
+				"type": "text",
+				"text": "hello"
+			}
+		],
+		"messages": [
+			{
+				"role": "user",
+				"content": "hello"
+			}
+		]
+	}`)
+
+	wRec := httptest.NewRecorder()
+	httpReq := httptest.NewRequest("POST", "/v1/messages", bytes.NewReader(reqBody))
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	proxySrv.handleProxyAnthropic(wRec, httpReq)
+
+	if wRec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", wRec.Code)
+	}
+	if strings.Contains(upstreamRequestBody, "x-anthropic-billing-header:") {
+		t.Fatalf("expected billing header to be removed before forwarding, got body: %s", upstreamRequestBody)
+	}
+	if !strings.Contains(upstreamRequestBody, "You are Claude Code") {
+		t.Fatalf("expected other prompt text to remain, got body: %s", upstreamRequestBody)
+	}
+
+	// Test case 2: Header alone in a system object text field
+	reqBody2 := []byte(`{
+		"system": [
+			{
+				"type": "text",
+				"text": "x-anthropic-billing-header: test-header;"
+			}
+		],
+		"messages": []
+	}`)
+	httpReq2 := httptest.NewRequest("POST", "/v1/messages", bytes.NewReader(reqBody2))
+	httpReq2.Header.Set("Content-Type", "application/json")
+	proxySrv.handleProxyAnthropic(httptest.NewRecorder(), httpReq2)
+
+	if strings.Contains(upstreamRequestBody, "x-anthropic-billing-header:") {
+		t.Fatalf("expected lone billing header to be removed, got body: %s", upstreamRequestBody)
+	}
+
+	// Test case 3: Order independence (system after messages) and safety (header in message content)
+	reqBody3 := []byte(`{
+		"messages": [
+			{
+				"role": "user",
+				"content": "Do not remove this: x-anthropic-billing-header: keep-me;"
+			}
+		],
+		"system": "x-anthropic-billing-header: remove-me;\nSystem prompt",
+		"model": "claude-3-5-sonnet"
+	}`)
+	httpReq3 := httptest.NewRequest("POST", "/v1/messages", bytes.NewReader(reqBody3))
+	httpReq3.Header.Set("Content-Type", "application/json")
+	proxySrv.handleProxyAnthropic(httptest.NewRecorder(), httpReq3)
+
+	if !strings.Contains(upstreamRequestBody, "keep-me") {
+		t.Fatalf("expected header in message to be PRESERVED, got body: %s", upstreamRequestBody)
+	}
+	if strings.Contains(upstreamRequestBody, "remove-me") {
+		t.Fatalf("expected header in system to be REMOVED, even when system is after messages, got body: %s", upstreamRequestBody)
+	}
+	if !strings.Contains(upstreamRequestBody, "System prompt") {
+		t.Fatalf("expected system prompt content to remain, got body: %s", upstreamRequestBody)
 	}
 }
 
@@ -1203,15 +1329,15 @@ func TestResolveSessionWithAuthoritativeMetadata(t *testing.T) {
 	defer dbMgr.Close()
 
 	seedID, err := dbMgr.InsertLog(&UnifiedLog{
-		Provider:    "anthropic",
-		Model:       "claude-test",
-		Path:        "/v1/messages",
-		StatusCode:  http.StatusOK,
-		Prompt:      []ChatMessage{{Role: "user", Content: "你好"}},
-		Response:    ChatMessage{Role: "assistant", Content: "你好"},
-		RawRequest:  `{"metadata":{"user_id":"{\"session_id\":\"claude-session-123\"}"}}`,
-		RawResponse: `{"ok":true}`,
-		SessionID:   "claude-session-123",
+		Provider:       "anthropic",
+		Model:          "claude-test",
+		Path:           "/v1/messages",
+		StatusCode:     http.StatusOK,
+		Prompt:         []ChatMessage{{Role: "user", Content: "你好"}},
+		Response:       ChatMessage{Role: "assistant", Content: "你好"},
+		RawRequest:     `{"metadata":{"user_id":"{\"session_id\":\"claude-session-123\"}"}}`,
+		RawResponse:    `{"ok":true}`,
+		SessionID:      "claude-session-123",
 		RequestHandles: []ConversationHandle{{Kind: "session_id", Value: "claude-session-123"}},
 	})
 	if err != nil {
