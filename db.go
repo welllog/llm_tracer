@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -83,14 +84,17 @@ type UsageStats struct {
 }
 
 type SessionMetadata struct {
-	SessionID      string `json:"sessionId"`
-	SessionSummary string `json:"sessionSummary"`
-	StartTime      string `json:"startTime"`
-	EndTime        string `json:"endTime"`
-	TotalTokens    int    `json:"totalTokens"`
-	MessageCount   int    `json:"messageCount"`
-	Model          string `json:"model"`
-	Provider       string `json:"provider"`
+	SessionID                string `json:"sessionId"`
+	SessionSummary           string `json:"sessionSummary"`
+	StartTime                string `json:"startTime"`
+	EndTime                  string `json:"endTime"`
+	TotalTokens              int    `json:"totalTokens"`
+	TotalInputUncachedTokens int    `json:"totalInputUncachedTokens"`
+	TotalInputCachedTokens   int    `json:"totalInputCachedTokens"`
+	TotalOutputTokens        int    `json:"totalOutputTokens"`
+	MessageCount             int    `json:"messageCount"`
+	Model                    string `json:"model"`
+	Provider                 string `json:"provider"`
 }
 
 func (log *LogSummary) normalizeAnthropicTokens() {
@@ -293,7 +297,7 @@ func insertConversationHandles(tx *sql.Tx, logID int64, source string, handles [
 	return nil
 }
 
-func (mgr *DBManager) GetLogs(page, pageSize int, provider, model, keyword string, statusFilter *int, excludeBranches bool) ([]LogSummary, int, error) {
+func (mgr *DBManager) GetLogs(page, pageSize int, provider, model, keyword string, statusFilter string, excludeBranches bool) ([]LogSummary, int, error) {
 	if page < 1 {
 		page = 1
 	}
@@ -317,9 +321,19 @@ func (mgr *DBManager) GetLogs(page, pageSize int, provider, model, keyword strin
 		whereClause += " AND model LIKE ?"
 		args = append(args, "%"+model+"%")
 	}
-	if statusFilter != nil {
-		whereClause += " AND status_code = ?"
-		args = append(args, *statusFilter)
+	switch statusFilter {
+	case "success":
+		whereClause += " AND status_code >= 200 AND status_code < 300"
+	case "error":
+		whereClause += " AND (status_code < 200 OR status_code >= 300)"
+	case "":
+		// no filter
+	default:
+		// 兼容直接传数字状态码（如 "200"）
+		if _, err := strconv.Atoi(statusFilter); err == nil {
+			whereClause += " AND status_code = ?"
+			args = append(args, statusFilter)
+		}
 	}
 	if keyword != "" {
 		whereClause += " AND (raw_request LIKE ? OR raw_response LIKE ? OR error_message LIKE ?)"
@@ -1024,6 +1038,9 @@ func (mgr *DBManager) GetSessions(page, pageSize int, keyword string) ([]Session
 				datetime(MIN(created_at), 'localtime') as start_time,
 				datetime(MAX(created_at), 'localtime') as end_time,
 				SUM(total_tokens) as sum_tokens,
+				SUM(CASE WHEN provider='anthropic' THEN input_tokens ELSE input_tokens - COALESCE(cached_tokens, 0) END) as sum_input_uncached,
+				SUM(CASE WHEN provider='anthropic' THEN COALESCE(cache_read_tokens, 0) ELSE COALESCE(cached_tokens, 0) END) as sum_input_cached,
+				SUM(output_tokens) as sum_output,
 				COUNT(*) as msg_count,
 				MAX(model) as last_model,
 				MAX(provider) as last_provider
@@ -1031,7 +1048,7 @@ func (mgr *DBManager) GetSessions(page, pageSize int, keyword string) ([]Session
 			WHERE 1=1 %s
 			GROUP BY effective_session_id
 		)
-		SELECT effective_session_id, first_id, last_id, start_time, end_time, sum_tokens, msg_count, last_model, last_provider
+		SELECT effective_session_id, first_id, last_id, start_time, end_time, sum_tokens, sum_input_uncached, sum_input_cached, sum_output, msg_count, last_model, last_provider
 		FROM SessionGroups
 		ORDER BY last_id DESC
 		LIMIT ? OFFSET ?`, func() string {
@@ -1058,7 +1075,8 @@ func (mgr *DBManager) GetSessions(page, pageSize int, keyword string) ([]Session
 		var firstID, discardLastID int64
 		err := rows.Scan(
 			&s.SessionID, &firstID, &discardLastID, &s.StartTime, &s.EndTime,
-			&s.TotalTokens, &s.MessageCount, &s.Model, &s.Provider,
+			&s.TotalTokens, &s.TotalInputUncachedTokens, &s.TotalInputCachedTokens, &s.TotalOutputTokens,
+			&s.MessageCount, &s.Model, &s.Provider,
 		)
 		if err != nil {
 			return nil, 0, err

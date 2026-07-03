@@ -258,7 +258,7 @@ func TestProxyAndLogging(t *testing.T) {
 	}
 
 	// 验证数据库日志记录
-	logs, total, err := dbMgr.GetLogs(1, 10, "", "", "", nil, false)
+	logs, total, err := dbMgr.GetLogs(1, 10, "", "", "", "", false)
 	if err != nil {
 		t.Fatalf("Failed to fetch logs from DB: %v", err)
 	}
@@ -307,13 +307,13 @@ func TestProxyAndLogging(t *testing.T) {
 	}
 
 	// 验证是否有 2 条日志在库中
-	_, total, _ = dbMgr.GetLogs(1, 10, "", "", "", nil, false)
+	_, total, _ = dbMgr.GetLogs(1, 10, "", "", "", "", false)
 	if total != 2 {
 		t.Fatalf("Expected 2 logs in DB after stream, got %d", total)
 	}
 
 	// 验证最后一条流式日志
-	allLogs, _, _ := dbMgr.GetLogs(1, 10, "", "", "", nil, false)
+	allLogs, _, _ := dbMgr.GetLogs(1, 10, "", "", "", "", false)
 	latestLogSummary := allLogs[0] // 倒序
 	latestLog, err := dbMgr.GetLogDetail(latestLogSummary.ID)
 	if err != nil {
@@ -754,7 +754,7 @@ func TestConversationChaining(t *testing.T) {
 	proxySrv.handleProxyOpenAI(wB1, reqB1)
 
 	// 从库中查询前两条日志，确保分配了不同的 Session ID 且都是根节点（ParentID 为 nil）
-	logs, total, err := dbMgr.GetLogs(1, 10, "", "", "", nil, false)
+	logs, total, err := dbMgr.GetLogs(1, 10, "", "", "", "", false)
 	if err != nil || total != 2 {
 		t.Fatalf("Expected 2 logs, got %d, err: %v", total, err)
 	}
@@ -798,7 +798,7 @@ func TestConversationChaining(t *testing.T) {
 	proxySrv.handleProxyOpenAI(wB2, reqB2)
 
 	// 重新查库，此时应该有 4 条记录
-	logs, total, _ = dbMgr.GetLogs(1, 10, "", "", "", nil, false)
+	logs, total, _ = dbMgr.GetLogs(1, 10, "", "", "", "", false)
 	if total != 4 {
 		t.Fatalf("Expected 4 logs, got %d", total)
 	}
@@ -841,7 +841,7 @@ func TestConversationChaining(t *testing.T) {
 	proxySrv.handleProxyOpenAI(wASummary, reqASummary)
 
 	// 检验是否归档在会话 A 下，且 parentID 指向 A 轮次 2
-	logs, total, _ = dbMgr.GetLogs(1, 10, "", "", "", nil, false)
+	logs, total, _ = dbMgr.GetLogs(1, 10, "", "", "", "", false)
 	if total != 5 {
 		t.Fatalf("Expected 5 logs, got %d", total)
 	}
@@ -867,7 +867,7 @@ func TestConversationChaining(t *testing.T) {
 	reqAFallback.RemoteAddr = "127.0.0.1:50002" // 本次端口变了
 	proxySrv.handleProxyOpenAI(wAFallback, reqAFallback)
 
-	logs, total, _ = dbMgr.GetLogs(1, 10, "", "", "", nil, false)
+	logs, total, _ = dbMgr.GetLogs(1, 10, "", "", "", "", false)
 	logAFallback := logs[0]
 	if logAFallback.SessionID != logA1.SessionID {
 		t.Errorf("Fallback summary request should be grouped in Session A %q, got %q", logA1.SessionID, logAFallback.SessionID)
@@ -895,7 +895,7 @@ func TestConversationChaining(t *testing.T) {
 	proxySrv.handleProxyOpenAI(wATrigger, reqATrigger)
 
 	// 获取触发 Tool Call 的那条日志
-	logs, total, _ = dbMgr.GetLogs(1, 10, "", "", "", nil, false)
+	logs, total, _ = dbMgr.GetLogs(1, 10, "", "", "", "", false)
 	logATrigger := logs[0]
 
 	// 确保在内存挂载池中有该工具调用
@@ -919,7 +919,7 @@ func TestConversationChaining(t *testing.T) {
 	proxySrv.handleProxyOpenAI(wSubagent, reqSubagent)
 
 	// 获取子代理产生的日志
-	logs, total, _ = dbMgr.GetLogs(1, 10, "", "", "", nil, false)
+	logs, total, _ = dbMgr.GetLogs(1, 10, "", "", "", "", false)
 	logSubagent := logs[0]
 
 	// 3. 校验子代理日志是否正确绑定到了主会话，且 parent_id / parent_tool_call_id 精准写入
@@ -1137,7 +1137,7 @@ func TestResponsesContinuationChaining(t *testing.T) {
 	secondRec := httptest.NewRecorder()
 	proxySrv.handleProxyOpenAIResponses(secondRec, secondReq)
 
-	logs, total, err := dbMgr.GetLogs(1, 10, "", "", "", nil, false)
+	logs, total, err := dbMgr.GetLogs(1, 10, "", "", "", "", false)
 	if err != nil {
 		t.Fatalf("failed to fetch logs: %v", err)
 	}
@@ -1214,7 +1214,7 @@ func TestProxyDoesNotFailOnResponseParseError(t *testing.T) {
 		t.Fatalf("expected raw payload to pass through, got %q", string(respBody))
 	}
 
-	logs, total, err := dbMgr.GetLogs(1, 10, "", "", "", nil, false)
+	logs, total, err := dbMgr.GetLogs(1, 10, "", "", "", "", false)
 	if err != nil {
 		t.Fatalf("failed to fetch logs: %v", err)
 	}
@@ -1280,7 +1280,7 @@ func TestToolResultContinuationChaining(t *testing.T) {
 	secondRec := httptest.NewRecorder()
 	proxySrv.handleProxyOpenAI(secondRec, secondReq)
 
-	logs, total, err := dbMgr.GetLogs(1, 10, "", "", "", nil, false)
+	logs, total, err := dbMgr.GetLogs(1, 10, "", "", "", "", false)
 	if err != nil {
 		t.Fatalf("failed to fetch logs: %v", err)
 	}

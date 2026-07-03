@@ -165,10 +165,9 @@ input:focus, select:focus, textarea:focus {
   box-shadow: 0 0 10px rgba(0, 242, 254, 0.15);
 }
 
-/* 代码字体 */
+/* 代码字体（仅设字体族；字号由各处的 text-[Npx] / text-xs 等控制） */
 .code-font {
   font-family: 'JetBrains Mono', monospace;
-  font-size: 0.9em;
 }
 
 /* 呼吸灯效果 */

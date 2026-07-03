@@ -753,11 +753,9 @@ func (s *ProxyServer) handleGetLogs(w http.ResponseWriter, r *http.Request) {
 	model := q.Get("model")
 	keyword := q.Get("keyword")
 
-	var statusFilter *int
+	var statusFilter string
 	if statusStr := q.Get("status"); statusStr != "" {
-		if status, err := strconv.Atoi(statusStr); err == nil {
-			statusFilter = &status
-		}
+		statusFilter = statusStr
 	}
 
 	excludeBranches := true

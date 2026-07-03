@@ -54,31 +54,6 @@ const IconRefresh = ({ className }) => (
   </svg>
 );
 
-const IconCpu = () => (
-  <svg
-    xmlns="http://www.w3.org/2000/svg"
-    width="16"
-    height="16"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    strokeWidth="2"
-    strokeLinecap="round"
-    strokeLinejoin="round"
-  >
-    <rect x="4" y="4" width="16" height="16" rx="2" ry="2" />
-    <rect x="9" y="9" width="6" height="6" />
-    <line x1="9" y1="1" x2="9" y2="4" />
-    <line x1="15" y1="1" x2="15" y2="4" />
-    <line x1="9" y1="20" x2="9" y2="23" />
-    <line x1="15" y1="20" x2="15" y2="23" />
-    <line x1="20" y1="9" x2="23" y2="9" />
-    <line x1="20" y1="15" x2="23" y2="15" />
-    <line x1="1" y1="9" x2="4" y2="9" />
-    <line x1="1" y1="15" x2="4" y2="15" />
-  </svg>
-);
-
 const IconClock = () => (
   <svg
     xmlns="http://www.w3.org/2000/svg"
@@ -93,22 +68,6 @@ const IconClock = () => (
   >
     <circle cx="12" cy="12" r="10" />
     <polyline points="12 6 12 12 16 14" />
-  </svg>
-);
-
-const IconFlame = () => (
-  <svg
-    xmlns="http://www.w3.org/2000/svg"
-    width="14"
-    height="14"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    strokeWidth="2"
-    strokeLinecap="round"
-    strokeLinejoin="round"
-  >
-    <path d="M8.5 14.5A2.5 2.5 0 0 0 11 12c0-1.38-.5-2-1-3-1.072-2.143-.224-4.054 2-6 .5 2.5 2 4.9 4 6.5 2 1.6 3 3.5 3 5.5a7 7 0 1 1-14 0c0-1.153.433-2.294 1-3a2.5 2.5 0 0 0 2.5 2.5z" />
   </svg>
 );
 
@@ -377,6 +336,972 @@ function simplifyUserPrompt(content) {
   return text.trim();
 }
 
+function shortSessionId(sessionId) {
+  if (!sessionId) return "";
+  return sessionId.replace(/-/g, "").slice(0, 6);
+}
+
+function formatTokenCount(n) {
+  if (n == null) return "0";
+  if (n >= 1000000) return `${(n / 1000000).toFixed(2)}M`;
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}K`;
+  return `${n}`;
+}
+
+// ==========================================
+// 日志详情组件：modal 与 inline 共用同一份渲染
+// ==========================================
+function LogDetail({ log, isLoading, sessionContext, onOpenSubLog, defaultTab = "trace" }) {
+  const [activeTab, setActiveTab] = useState(defaultTab);
+  const [selectedToolIndex, setSelectedToolIndex] = useState(0);
+  const [toolSearchQuery, setToolSearchQuery] = useState("");
+  const [showSystemPrompt, setShowSystemPrompt] = useState(false);
+
+  // 切换到新日志时重置内部 UI 状态
+  useEffect(() => {
+    setActiveTab(defaultTab);
+    setSelectedToolIndex(0);
+    setToolSearchQuery("");
+    setShowSystemPrompt(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [log?.id]);
+
+  const sessionLogs = sessionContext?.logs || [];
+  const isSessionLoading = sessionContext?.isLoading || false;
+  const totalSessionTokens = sessionLogs.reduce(
+    (sum, l) => sum + (l.totalTokens || 0),
+    0,
+  );
+  const totalSessionInputTokens = sessionLogs.reduce(
+    (sum, l) => sum + (l.inputTokens || 0),
+    0,
+  );
+  const totalSessionOutputTokens = sessionLogs.reduce(
+    (sum, l) => sum + (l.outputTokens || 0),
+    0,
+  );
+  const totalSessionCachedTokens = sessionLogs.reduce(
+    (sum, l) => sum + (l.cachedTokens || 0),
+    0,
+  );
+  const totalSessionUncachedInputTokens =
+    totalSessionInputTokens - totalSessionCachedTokens;
+
+  // 渲染子代理会话的内联时间链
+  const renderSubLogsForTool = (toolCallId) => {
+    if (!log || !log.subLogs) return null;
+    const matchingSubLogs = log.subLogs.filter(
+      (sl) => sl.parentToolCallId === toolCallId,
+    );
+    if (matchingSubLogs.length === 0) return null;
+
+    return (
+      <div className="mt-3 border-t border-slate-800/80 pt-3 flex flex-col gap-3 font-sans">
+        <div className="text-[10px] font-bold text-amber-400/90 uppercase tracking-wider flex items-center gap-1.5">
+          <span>↳ 子代理会话执行追踪 (Subagent Trace)</span>
+          <span className="px-1.5 py-0.2 rounded bg-amber-950/50 text-[8px] border border-amber-900/30">
+            共 {matchingSubLogs.length} 条调用
+          </span>
+        </div>
+        <div className="flex flex-col gap-3 pl-3.5 border-l border-amber-500/20">
+          {matchingSubLogs.map((subLog) => (
+            <div
+              key={subLog.id}
+              className="p-3 bg-slate-900/30 border border-slate-800/50 rounded-xl text-xs flex flex-col gap-2.5"
+            >
+              <div className="flex justify-between items-center">
+                <span className="text-[9px] font-mono text-slate-400">
+                  分支日志 #{subLog.id} • {subLog.model}
+                </span>
+                <span className="text-[9px] px-1.5 py-0.5 rounded bg-black/30 font-mono text-orange-400/90">
+                  {(subLog.durationMs / 1000).toFixed(2)}s •{" "}
+                  {subLog.totalTokens} tkn
+                </span>
+              </div>
+
+              <div className="flex flex-col gap-2">
+                {subLog.prompt &&
+                  subLog.prompt
+                    .filter((p) => p.role !== "system")
+                    .map((m, mIdx) => (
+                      <div
+                        key={mIdx}
+                        className="bg-slate-950/30 p-2.5 rounded-lg border border-slate-900/60 leading-relaxed text-[11px]"
+                      >
+                        <div className="font-bold text-[9px] text-cyan-400/80 mb-1">
+                          {m.role === "user"
+                            ? "👤 User"
+                            : m.role === "tool"
+                              ? "🛠️ Tool Response"
+                              : "🤖 Assistant"}
+                          :
+                        </div>
+                        <div className="text-slate-300 whitespace-pre-wrap">
+                          {m.content}
+                        </div>
+                        {m.tool_calls &&
+                          m.tool_calls.map((tc, tcIdx) => (
+                            <div
+                              key={tcIdx}
+                              className="mt-1.5 p-2 bg-slate-950/80 rounded border border-slate-900 font-mono text-[9px]"
+                            >
+                              <span className="text-orange-400/80">
+                                Call: {tc.name}
+                              </span>
+                              <span className="text-slate-500 block break-all">
+                                Args: {tc.arguments}
+                              </span>
+                            </div>
+                          ))}
+                      </div>
+                    ))}
+
+                {subLog.response &&
+                  (subLog.response.content ||
+                    (subLog.response.tool_calls &&
+                      subLog.response.tool_calls.length > 0)) && (
+                    <div className="bg-slate-950/45 p-2.5 rounded-lg border border-slate-900/85 border-l border-l-cyan-500/40 leading-relaxed text-[11px]">
+                      <div className="font-bold text-[9px] text-cyan-400 mb-1">
+                        🤖 Assistant (最新回复):
+                      </div>
+                      {subLog.response.thinking && (
+                        <div className="text-purple-400/80 italic text-[10px] mb-1">
+                          Thinking: {subLog.response.thinking}
+                        </div>
+                      )}
+                      <div className="text-slate-200 whitespace-pre-wrap">
+                        {subLog.response.content}
+                      </div>
+                      {subLog.response.tool_calls &&
+                        subLog.response.tool_calls.map((tc, tcIdx) => (
+                          <div
+                            key={tcIdx}
+                            className="mt-1.5 p-2 bg-slate-950/80 rounded border border-slate-900 font-mono text-[9px]"
+                          >
+                            <span className="text-orange-400/80">
+                              Call: {tc.name}
+                            </span>
+                            <span className="text-slate-500 block break-all">
+                              Args: {tc.arguments}
+                            </span>
+                          </div>
+                        ))}
+                    </div>
+                  )}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  };
+
+  if (isLoading) {
+    return (
+      <div className="flex-1 flex flex-col items-center justify-center text-slate-500 gap-4">
+        <IconRefresh className="animate-spin text-cyan-400 w-8 h-8" />
+        <p className="text-xs font-medium tracking-wide">
+          加载请求结构化详情中...
+        </p>
+      </div>
+    );
+  }
+
+  if (!log) {
+    return (
+      <div className="flex-1 flex flex-col items-center justify-center text-red-400 gap-3">
+        <span>加载日志失败，请稍后重试</span>
+      </div>
+    );
+  }
+
+  const showSessionTab = !!sessionContext && !!log.sessionId;
+
+  return (
+    <div className="flex-1 flex flex-col overflow-hidden gap-6 min-h-0">
+      {/* 详情头部元数据卡片 (Grid 布局，突出核心指标) */}
+      <div className="p-5 bg-slate-950/35 border border-slate-900/60 rounded-2xl flex flex-col gap-4 lg:flex-row lg:justify-between lg:items-center">
+        <div className="flex flex-col gap-2 min-w-0">
+          <div className="flex flex-wrap items-center gap-2.5">
+            <span className="text-base font-bold font-mono text-cyan-400 tracking-tight truncate">
+              {log.model}
+            </span>
+            <span className="text-[10px] px-2 py-0.5 rounded-full bg-slate-900 border border-slate-800 text-slate-400 uppercase font-bold tracking-wider shrink-0">
+              {log.provider}
+            </span>
+          </div>
+          <span className="text-[10px] text-slate-500 font-mono truncate">
+            {log.sessionId
+              ? `会话 ${shortSessionId(log.sessionId)} #${log.sessionSeq} · ID ${log.id}`
+              : `ID: ${log.id}`}{" "}
+            • Path: {log.path}
+          </span>
+        </div>
+
+        <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 text-xs font-mono shrink-0">
+          <div className="flex flex-col items-start lg:items-end px-3.5 py-2 rounded-xl bg-amber-950/15 border border-amber-900/15">
+            <span className="text-[9px] text-slate-500 font-medium uppercase tracking-wider mb-0.5">
+              请求耗时
+            </span>
+            <span className="font-bold text-sm text-amber-400">
+              {(log.durationMs / 1000).toFixed(2)}s
+            </span>
+          </div>
+          <div className="flex flex-col items-start lg:items-end px-3.5 py-2 rounded-xl bg-orange-950/15 border border-orange-900/15">
+            <span className="text-[9px] text-slate-500 font-medium uppercase tracking-wider mb-0.5">
+              未缓输入
+            </span>
+            <span className="font-bold text-sm text-orange-400">
+              {log.inputTokens - log.cachedTokens}
+            </span>
+          </div>
+          <div className="flex flex-col items-start lg:items-end px-3.5 py-2 rounded-xl bg-cyan-950/15 border border-cyan-900/15">
+            <span className="text-[9px] text-slate-500 font-medium uppercase tracking-wider mb-0.5">
+              缓存输入
+            </span>
+            <span className="font-bold text-sm text-cyan-400">
+              {log.cachedTokens}
+            </span>
+            {log.cacheCreationTokens > 0 && (
+              <span className="text-[8px] text-slate-400 mt-0.5">
+                另写 {log.cacheCreationTokens}
+              </span>
+            )}
+          </div>
+          <div className="flex flex-col items-start lg:items-end px-3.5 py-2 rounded-xl bg-indigo-950/15 border border-indigo-900/15">
+            <span className="text-[9px] text-slate-500 font-medium uppercase tracking-wider mb-0.5">
+              输出
+            </span>
+            <span className="font-bold text-sm text-indigo-400">
+              {log.outputTokens}
+            </span>
+          </div>
+          <div
+            className={`flex flex-col items-start lg:items-end px-3.5 py-2 rounded-xl border ${
+              log.statusCode >= 200 && log.statusCode < 300
+                ? "bg-emerald-950/15 border-emerald-900/15 text-emerald-400"
+                : "bg-red-950/15 border-red-900/15 text-red-400"
+            }`}
+          >
+            <span className="text-[9px] text-slate-500 font-medium uppercase tracking-wider mb-0.5">
+              状态代码
+            </span>
+            <span className="font-bold text-sm">{log.statusCode}</span>
+          </div>
+        </div>
+      </div>
+
+      {/* 时序控制 Tab */}
+      <div className="flex border-b border-slate-900 pb-1 gap-6 shrink-0">
+        <button
+          onClick={() => setActiveTab("trace")}
+          className={`pb-2.5 text-xs font-bold border-b-2 transition-all ${
+            activeTab === "trace"
+              ? "border-cyan-400 text-cyan-400 drop-shadow-[0_0_8px_rgba(6,182,212,0.3)]"
+              : "border-transparent text-slate-400 hover:text-slate-200"
+          }`}
+        >
+          时序追踪 (Trace)
+        </button>
+        <button
+          onClick={() => setActiveTab("prompt")}
+          className={`pb-2.5 text-xs font-bold border-b-2 transition-all ${
+            activeTab === "prompt"
+              ? "border-cyan-400 text-cyan-400 drop-shadow-[0_0_8px_rgba(6,182,212,0.3)]"
+              : "border-transparent text-slate-400 hover:text-slate-200"
+          }`}
+        >
+          请求消息 (
+          {log.prompt ? log.prompt.filter((p) => p.role !== "system").length : 0}
+          )
+        </button>
+        {showSessionTab && (
+          <button
+            onClick={() => setActiveTab("session")}
+            className={`pb-2.5 text-xs font-bold border-b-2 transition-all ${
+              activeTab === "session"
+                ? "border-cyan-400 text-cyan-400 drop-shadow-[0_0_8px_rgba(6,182,212,0.3)]"
+                : "border-transparent text-slate-400 hover:text-slate-200"
+            }`}
+          >
+            会话历史 (Session)
+            {totalSessionTokens > 0 ? ` • ${totalSessionTokens} T` : ""}
+          </button>
+        )}
+        {log.tools && log.tools.length > 0 && (
+          <button
+            onClick={() => setActiveTab("tools")}
+            className={`pb-2.5 text-xs font-bold border-b-2 transition-all ${
+              activeTab === "tools"
+                ? "border-cyan-400 text-cyan-400 drop-shadow-[0_0_8px_rgba(6,182,212,0.3)]"
+                : "border-transparent text-slate-400 hover:text-slate-200"
+            }`}
+          >
+            定义的工具 ({log.tools.length})
+          </button>
+        )}
+        <button
+          onClick={() => setActiveTab("raw_req")}
+          className={`pb-2.5 text-xs font-bold border-b-2 transition-all ${
+            activeTab === "raw_req"
+              ? "border-cyan-400 text-cyan-400 drop-shadow-[0_0_8px_rgba(6,182,212,0.3)]"
+              : "border-transparent text-slate-400 hover:text-slate-200"
+          }`}
+        >
+          原始请求 JSON
+        </button>
+        <button
+          onClick={() => setActiveTab("raw_resp")}
+          className={`pb-2.5 text-xs font-bold border-b-2 transition-all ${
+            activeTab === "raw_resp"
+              ? "border-cyan-400 text-cyan-400 drop-shadow-[0_0_8px_rgba(6,182,212,0.3)]"
+              : "border-transparent text-slate-400 hover:text-slate-200"
+          }`}
+        >
+          原始响应 Raw
+        </button>
+      </div>
+
+      {/* Tab 内容区 */}
+      <div className="flex-1 overflow-y-auto pr-1.5 min-h-0 flex flex-col gap-4 scroll-isolated">
+        {/* 1. 时序追踪 (Trace) */}
+        {activeTab === "trace" && (
+          <div className="flex flex-col gap-5">
+            <div className="p-4 bg-slate-950/20 border border-slate-900 rounded-xl flex flex-col gap-3">
+              <div className="flex justify-between items-center text-xs text-slate-400 font-mono">
+                <span className="font-semibold text-slate-300">
+                  时序可视化时间线
+                </span>
+                <span className="text-cyan-400 font-bold">
+                  {(log.durationMs / 1000).toFixed(2)}s
+                </span>
+              </div>
+
+              <div className="h-7 w-full bg-slate-950/80 rounded-lg overflow-hidden flex relative p-0.5 border border-slate-900">
+                <div
+                  className="h-full timeline-shimmer rounded-md"
+                  style={{ flex: 1 }}
+                />
+                <div className="absolute inset-0 flex justify-end items-center pr-4 text-[9px] font-bold text-white uppercase tracking-wider drop-shadow-md">
+                  <span>
+                    传输流 • {(log.durationMs / 1000).toFixed(2)}s
+                  </span>
+                </div>
+              </div>
+
+              {log.response &&
+                log.response.tool_calls &&
+                log.response.tool_calls.length > 0 && (
+                  <div className="mt-1.5 flex flex-col gap-2.5">
+                    <span className="text-[10px] text-slate-500 uppercase font-bold tracking-wider">
+                      执行的 Tool Call Spans
+                    </span>
+                    <div className="flex flex-col gap-2">
+                      {log.response.tool_calls.map((tc, idx) => (
+                        <div
+                          key={idx}
+                          className="flex items-center justify-between px-3 py-2.5 bg-slate-950/40 border border-slate-900 rounded-xl text-xs"
+                        >
+                          <div className="flex items-center gap-2 min-w-0">
+                            <span className="text-[9px] font-bold px-2 py-0.5 bg-orange-950/80 border border-orange-900/20 text-orange-400 rounded-md shrink-0">
+                              TOOL
+                            </span>
+                            <span className="font-mono text-slate-200 font-semibold truncate">
+                              {tc.name}
+                            </span>
+                          </div>
+                          <span className="text-[9px] text-slate-500 font-mono shrink-0">
+                            id: {tc.id}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+            </div>
+          </div>
+        )}
+
+        {/* 2. 对话结构化展示 */}
+        {activeTab === "prompt" && (
+          <div className="flex flex-col gap-4">
+            <div className="flex flex-col gap-2.5">
+              <button
+                onClick={() => setShowSystemPrompt(!showSystemPrompt)}
+                className="flex justify-between items-center px-4 py-3 bg-slate-950/40 hover:bg-slate-900/60 border border-slate-900/85 rounded-xl text-xs text-slate-300 transition-all active:scale-[0.99]"
+              >
+                <span className="flex items-center gap-2">
+                  <IconTerminal />
+                  <span className="font-semibold">System 提示词</span>
+                </span>
+                <span className="text-slate-400">
+                  {showSystemPrompt ? (
+                    <IconChevronDown />
+                  ) : (
+                    <IconChevronRight />
+                  )}
+                </span>
+              </button>
+              {showSystemPrompt && (
+                <div className="p-4 bg-slate-950/60 border border-slate-900 rounded-xl text-xs font-mono text-slate-400 whitespace-pre-wrap leading-relaxed">
+                  {log.prompt &&
+                  log.prompt.filter((p) => p.role === "system").length > 0
+                    ? log.prompt
+                        .filter((p) => p.role === "system")
+                        .map((p) => p.content)
+                        .join("\n")
+                    : "无系统提示词"}
+                </div>
+              )}
+            </div>
+
+            <div className="flex flex-col gap-4">
+              <h3 className="text-xs uppercase font-bold tracking-wider text-slate-400">
+                消息流记录
+              </h3>
+              {log.prompt &&
+                log.prompt
+                  .filter((p) => p.role !== "system")
+                  .map((m, idx) => {
+                    const isUser = m.role === "user";
+                    const isTool = m.role === "tool";
+                    const isAssistant = m.role === "assistant";
+
+                    return (
+                      <div
+                        key={idx}
+                        className={`p-5 rounded-2xl border flex flex-col gap-3.5 shadow-sm ${
+                          isUser
+                            ? "bg-cyan-950/10 border-cyan-950/40"
+                            : isTool
+                              ? "bg-orange-950/10 border-orange-950/40"
+                              : "bg-slate-950/25 border-slate-900"
+                        }`}
+                      >
+                        <div className="flex justify-between items-center">
+                          <span
+                            className={`text-[10px] font-bold uppercase tracking-wider px-2.5 py-1 rounded-md border ${
+                              isUser
+                                ? "bg-cyan-950/60 border-cyan-900/30 text-cyan-400"
+                                : isTool
+                                  ? "bg-orange-950/60 border-orange-900/30 text-orange-400"
+                                  : "bg-slate-900/60 border-slate-800/80 text-cyan-400"
+                            }`}
+                          >
+                            {isUser
+                              ? "👤 User"
+                              : isTool
+                                ? "🛠️ Tool Response"
+                                : "🤖 Assistant"}
+                            {m.name && (
+                              <span className="text-slate-400 font-mono text-[9px] ml-1">
+                                ({m.name})
+                              </span>
+                            )}
+                          </span>
+                          {m.tool_call_id && (
+                            <span className="text-[9px] text-slate-500 font-mono">
+                              ID: {m.tool_call_id}
+                            </span>
+                          )}
+                        </div>
+
+                        {isAssistant && m.thinking && (
+                          <div className="p-3.5 bg-slate-900/40 border border-slate-800/60 rounded-xl text-xs text-slate-400/90 italic whitespace-pre-wrap border-l-2 border-l-purple-500/60">
+                            <div className="text-[9px] font-bold text-purple-400 uppercase tracking-wider not-italic mb-1">
+                              思考过程 (Thinking)
+                            </div>
+                            {m.thinking}
+                          </div>
+                        )}
+
+                        {m.content && (
+                          <div className="text-sm leading-relaxed tracking-wide text-slate-200 whitespace-pre-wrap mt-0.5">
+                            {m.content}
+                          </div>
+                        )}
+
+                        {isAssistant &&
+                          m.tool_calls &&
+                          m.tool_calls.length > 0 && (
+                            <div className="mt-1 flex flex-col gap-2 font-mono">
+                              <div className="text-[9px] font-bold text-orange-400 uppercase tracking-wider">
+                                触发工具调用 (Tool Calls)
+                              </div>
+                              {m.tool_calls.map((tc, tcIdx) => (
+                                <div
+                                  key={tcIdx}
+                                  className="p-3 bg-slate-950/40 border border-slate-900 rounded-xl text-xs text-slate-300"
+                                >
+                                  <div>
+                                    <span className="text-slate-500">
+                                      Method:
+                                    </span>{" "}
+                                    <span className="text-orange-400 font-semibold">
+                                      {tc.name}
+                                    </span>
+                                  </div>
+                                  <div className="mt-1">
+                                    <span className="text-slate-500">
+                                      Args:
+                                    </span>{" "}
+                                    <span className="text-emerald-400/90">
+                                      {tc.arguments}
+                                    </span>
+                                  </div>
+                                  {renderSubLogsForTool(tc.id)}
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                      </div>
+                    );
+                  })}
+
+              {/* 渲染当次最新大模型回复 */}
+              {log.response &&
+                (log.response.content ||
+                  log.response.thinking ||
+                  (log.response.tool_calls &&
+                    log.response.tool_calls.length > 0)) && (
+                  <div className="p-5 rounded-2xl border flex flex-col gap-3.5 shadow-sm bg-slate-950/25 border-slate-900 border-l-[3px] border-l-cyan-500/50">
+                    <div className="flex justify-between items-center">
+                      <span className="text-[10px] font-bold uppercase tracking-wider px-2.5 py-1 rounded-md border bg-slate-900/60 border-slate-800/80 text-cyan-400">
+                        🤖 Assistant (最新回复)
+                      </span>
+                    </div>
+
+                    {log.response.thinking && (
+                      <div className="p-3.5 bg-slate-900/40 border border-slate-800/60 rounded-xl text-xs text-slate-400/90 italic whitespace-pre-wrap border-l-2 border-l-purple-500/60">
+                        <div className="text-[9px] font-bold text-purple-400 uppercase tracking-wider not-italic mb-1">
+                          思考过程 (Thinking)
+                        </div>
+                        {log.response.thinking}
+                      </div>
+                    )}
+
+                    {log.response.content && (
+                      <div className="text-sm leading-relaxed tracking-wide text-slate-200 whitespace-pre-wrap mt-0.5">
+                        {log.response.content}
+                      </div>
+                    )}
+
+                    {log.response.tool_calls &&
+                      log.response.tool_calls.length > 0 && (
+                        <div className="mt-1 flex flex-col gap-2 font-mono">
+                          <div className="text-[9px] font-bold text-orange-400 uppercase tracking-wider">
+                            触发工具调用 (Tool Calls)
+                          </div>
+                          {log.response.tool_calls.map((tc, tcIdx) => (
+                            <div
+                              key={tcIdx}
+                              className="p-3 bg-slate-950/40 border border-slate-900 rounded-xl text-xs text-slate-300"
+                            >
+                              <div>
+                                <span className="text-slate-500">
+                                  Method:
+                                </span>{" "}
+                                <span className="text-orange-400 font-semibold">
+                                  {tc.name}
+                                </span>
+                              </div>
+                              <div className="mt-1">
+                                <span className="text-slate-500">
+                                  Args:
+                                </span>{" "}
+                                <span className="text-emerald-400/90">
+                                  {tc.arguments}
+                                </span>
+                              </div>
+                              {renderSubLogsForTool(tc.id)}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                  </div>
+                )}
+            </div>
+          </div>
+        )}
+
+        {/* 会话历史 (Session Trace) */}
+        {activeTab === "session" && showSessionTab && (
+          <div className="flex flex-col gap-5 select-none font-sans">
+            <div className="text-[10px] text-slate-400 font-bold uppercase tracking-wider mb-1 flex justify-between items-center bg-slate-950/20 px-4 py-2 border border-slate-900/50 rounded-xl">
+              <div className="flex items-center gap-2">
+                <span>🔗 会话轮次目录 / 点击可快速定位详情</span>
+                <span className="font-mono text-cyan-400">
+                  ({sessionLogs.length} 轮对话 • 未缓存输入{" "}
+                  {totalSessionUncachedInputTokens} / 缓存{" "}
+                  {totalSessionCachedTokens} / 输出{" "}
+                  {totalSessionOutputTokens} / 共 {totalSessionTokens} Tokens)
+                </span>
+              </div>
+              <button
+                onClick={() => sessionContext.onDelete?.(log.sessionId)}
+                className="flex items-center gap-1 text-[10px] font-bold text-red-400 hover:text-red-300 px-2.5 py-1 rounded-lg bg-red-950/20 hover:bg-red-950/40 border border-red-900/30 transition-all active:scale-95 cursor-pointer"
+                title="删除该会话所有请求日志"
+              >
+                <IconTrash />
+                <span>删除会话所有请求</span>
+              </button>
+            </div>
+
+            {isSessionLoading ? (
+              <div className="flex flex-col items-center justify-center py-20 text-slate-500 text-xs gap-2">
+                <IconRefresh className="animate-spin text-cyan-400" />
+                <span>加载会话目录中...</span>
+              </div>
+            ) : sessionLogs.length === 0 ? (
+              <div className="text-center py-20 text-slate-500 text-xs">
+                该会话暂无历史记录
+              </div>
+            ) : (
+              <div className="flex flex-col gap-3 relative pl-4 border-l border-slate-800/60 ml-3">
+                {sessionLogs.map((sLog, idx) => {
+                  const isCurrent = sLog.id === log.id;
+                  const isSuccess =
+                    sLog.statusCode >= 200 && sLog.statusCode < 300;
+
+                  let inputMsg = null;
+                  if (sLog.prompt && sLog.prompt.length > 0) {
+                    for (let i = sLog.prompt.length - 1; i >= 0; i--) {
+                      const m = sLog.prompt[i];
+                      if (m.role === "user" || m.role === "tool") {
+                        inputMsg = m;
+                        break;
+                      }
+                    }
+                  }
+
+                  let inputText = "";
+                  let inputRoleLabel = "";
+                  let inputRoleBadgeColor = "";
+                  if (inputMsg) {
+                    if (inputMsg.role === "user") {
+                      inputRoleLabel = "👤 User";
+                      inputRoleBadgeColor =
+                        "text-cyan-400 bg-cyan-950/30 border-cyan-900/30";
+                      inputText = simplifyUserPrompt(inputMsg.content || "");
+                    } else {
+                      inputRoleLabel = `🛠️ Tool (${inputMsg.name || "unknown"})`;
+                      inputRoleBadgeColor =
+                        "text-orange-400 bg-orange-950/30 border-orange-900/30";
+                      inputText = inputMsg.content || "";
+                    }
+                  } else {
+                    inputRoleLabel = "💬 Info";
+                    inputRoleBadgeColor =
+                      "text-slate-400 bg-slate-900/40 border-slate-800/40";
+                    inputText = sLog.sessionSummary || "";
+                  }
+
+                  const shortInput =
+                    inputText && inputText.trim() !== ""
+                      ? inputText.length > 95
+                        ? inputText.substring(0, 95) + "..."
+                        : inputText
+                      : "无详细输入";
+
+                  let outputText = "";
+                  let outputLabel = "";
+                  let outputBadgeColor = "";
+                  if (!isSuccess) {
+                    outputLabel = "❌ Error";
+                    outputBadgeColor =
+                      "text-red-400 bg-red-950/30 border-red-900/30";
+                    outputText =
+                      sLog.errorMessage || `HTTP Status ${sLog.statusCode}`;
+                  } else if (sLog.response) {
+                    const resp = sLog.response;
+                    const hasToolCalls =
+                      resp.tool_calls && resp.tool_calls.length > 0;
+                    const hasContent =
+                      resp.content && resp.content.trim() !== "";
+                    const hasThinking =
+                      resp.thinking && resp.thinking.trim() !== "";
+
+                    if (hasToolCalls) {
+                      outputLabel = "🔧 Tool Call";
+                      outputBadgeColor =
+                        "text-yellow-400 bg-yellow-950/30 border-yellow-900/30";
+                      const toolNames = resp.tool_calls
+                        .map((tc) => tc.name)
+                        .join(", ");
+                      outputText = `调用工具: [${toolNames}]`;
+                    } else if (hasContent) {
+                      outputLabel = "🤖 Assistant";
+                      outputBadgeColor =
+                        "text-emerald-400 bg-emerald-950/30 border-emerald-900/30";
+                      outputText = resp.content.trim();
+                    } else if (hasThinking) {
+                      outputLabel = "💭 Thinking";
+                      outputBadgeColor =
+                        "text-purple-400 bg-purple-950/30 border-purple-900/30";
+                      outputText = resp.thinking.trim();
+                    } else {
+                      outputLabel = "🤖 Assistant";
+                      outputBadgeColor =
+                        "text-slate-400 bg-slate-900/30 border-slate-800/30";
+                      outputText = "无输出内容";
+                    }
+                  } else {
+                    outputLabel = "🤖 Assistant";
+                    outputBadgeColor =
+                      "text-slate-400 bg-slate-900/30 border-slate-800/30";
+                    outputText = "无输出内容";
+                  }
+
+                  const shortOutput =
+                    outputText && outputText.trim() !== ""
+                      ? outputText.length > 95
+                        ? outputText.substring(0, 95) + "..."
+                        : outputText
+                      : "无详细输出";
+
+                  return (
+                    <div
+                      key={sLog.id}
+                      onClick={() => onOpenSubLog?.(sLog.id)}
+                      className={`p-3.5 rounded-xl border cursor-pointer relative transition-all flex flex-col gap-2 ${
+                        isCurrent
+                          ? "bg-slate-900/70 border-cyan-500/60 shadow-[0_0_12px_rgba(6,182,212,0.15)] translate-x-0.5"
+                          : "bg-slate-950/25 border-slate-900/80 hover:bg-slate-900/40 hover:border-slate-800/80"
+                      }`}
+                    >
+                      <div
+                        className={`absolute -left-[22px] top-6 w-2.5 h-2.5 rounded-full border-2 transition-all ${
+                          isCurrent
+                            ? "bg-cyan-400 border-slate-950 scale-110"
+                            : "bg-slate-800 border-slate-950 hover:bg-slate-700"
+                        }`}
+                      />
+
+                      <div className="flex justify-between items-center">
+                        <div className="flex items-center gap-2">
+                          <span
+                            className={`text-[10px] font-mono font-bold px-2 py-0.5 rounded transition-all ${
+                              isCurrent
+                                ? "bg-cyan-950 text-cyan-400"
+                                : "bg-slate-900 text-slate-400"
+                            }`}
+                          >
+                            Turn #{sLog.sessionSeq || idx + 1}
+                          </span>
+                          <span className="text-[9px] font-mono text-slate-500 truncate max-w-[120px] md:max-w-[180px]">
+                            {sLog.model}
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-2 text-[9px] font-mono text-slate-400">
+                          <span title={sLog.createdAt || ""}>
+                            {sLog.createdAt ? sLog.createdAt.split(" ")[1] : ""}
+                          </span>
+                          <span className="text-amber-400/80">
+                            {(sLog.durationMs / 1000).toFixed(2)}s
+                          </span>
+                          <span className="text-slate-700">│</span>
+                          <span
+                            className="text-orange-400/80"
+                            title={`未缓存输入 Token: ${sLog.inputTokens - sLog.cachedTokens}`}
+                          >
+                            未缓 {formatTokenCount(sLog.inputTokens - sLog.cachedTokens)}
+                          </span>
+                          <span
+                            className="text-cyan-400/80"
+                            title={`缓存输入 Token: ${sLog.cachedTokens}`}
+                          >
+                            缓存 {formatTokenCount(sLog.cachedTokens)}
+                          </span>
+                          <span className="text-slate-700">│</span>
+                          <span
+                            className="text-indigo-400/80"
+                            title={`输出 Token: ${sLog.outputTokens}`}
+                          >
+                            输出 {formatTokenCount(sLog.outputTokens)}
+                          </span>
+                          <span
+                            className={`font-bold px-1 py-0.2 rounded ${isSuccess ? "text-emerald-400 bg-emerald-950/20" : "text-red-400 bg-red-950/20"}`}
+                          >
+                            {sLog.statusCode}
+                          </span>
+                        </div>
+                      </div>
+
+                      <div className="flex flex-col gap-2 mt-1 select-text">
+                        <div className="flex items-start gap-2 text-[11px] leading-relaxed">
+                          <span
+                            className={`shrink-0 text-[8px] font-bold px-1.5 py-0.5 rounded border ${inputRoleBadgeColor} font-mono w-[60px] text-center`}
+                          >
+                            IN
+                          </span>
+                          <div className="flex-1 text-slate-300 min-w-0 truncate">
+                            <span className="text-slate-400 font-semibold mr-1">
+                              {inputRoleLabel}:
+                            </span>
+                            <span
+                              className={
+                                isCurrent
+                                  ? "text-slate-100 font-medium"
+                                  : "text-slate-400 hover:text-slate-200"
+                              }
+                            >
+                              {shortInput}
+                            </span>
+                          </div>
+                        </div>
+
+                        <div className="pl-[23px] text-slate-600 flex items-center -my-1">
+                          <span className="text-[9px] text-slate-600">↓</span>
+                        </div>
+
+                        <div className="flex items-start gap-2 text-[11px] leading-relaxed">
+                          <span
+                            className={`shrink-0 text-[8px] font-bold px-1.5 py-0.5 rounded border ${outputBadgeColor} font-mono w-[60px] text-center`}
+                          >
+                            OUT
+                          </span>
+                          <div className="flex-1 text-slate-300 min-w-0 truncate">
+                            <span className="text-slate-400 font-semibold mr-1">
+                              {outputLabel}:
+                            </span>
+                            <span
+                              className={
+                                isCurrent
+                                  ? "text-slate-100 font-medium"
+                                  : "text-slate-400 hover:text-slate-200"
+                              }
+                            >
+                              {shortOutput}
+                            </span>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* 3. 原始请求 Raw */}
+        {activeTab === "raw_req" && (
+          <CodeBlock
+            code={formatJSON(log.rawRequest)}
+            language="Raw HTTP Request Body"
+          />
+        )}
+
+        {/* 4. 原始响应 Raw */}
+        {activeTab === "raw_resp" && (
+          <CodeBlock
+            code={formatJSON(log.rawResponse)}
+            language="Raw Upstream Response"
+          />
+        )}
+
+        {/* 5. 已定义工具 (Tools) */}
+        {activeTab === "tools" &&
+          log.tools &&
+          log.tools.length > 0 && (
+            <div className="flex flex-col lg:flex-row gap-5 flex-1 min-h-0 h-full overflow-hidden">
+              <div className="w-full lg:w-[240px] flex flex-col gap-3 shrink-0 bg-slate-950/20 border border-slate-900/40 p-3.5 rounded-2xl min-h-0 overflow-y-auto">
+                <div className="relative flex items-center">
+                  <span className="absolute left-3.5 text-slate-500">
+                    <IconSearch />
+                  </span>
+                  <input
+                    type="text"
+                    placeholder="搜索工具名..."
+                    value={toolSearchQuery}
+                    onChange={(e) => {
+                      setToolSearchQuery(e.target.value);
+                      setSelectedToolIndex(0);
+                    }}
+                    className="w-full pl-9 pr-3.5 py-1.5 bg-slate-950/40 focus:bg-slate-950/85 text-[11px] border border-slate-800/85 focus:border-cyan-500/60 rounded-lg outline-none placeholder:text-slate-500 text-slate-200"
+                  />
+                </div>
+
+                <div className="flex flex-col gap-1.5 overflow-y-auto flex-1 pr-1 font-mono text-[11px]">
+                  {log.tools
+                    .map((tool, index) => ({ tool, index }))
+                    .filter(({ tool }) =>
+                      tool.name
+                        .toLowerCase()
+                        .includes(toolSearchQuery.toLowerCase()),
+                    )
+                    .map(({ tool, index }) => {
+                      const isSelected = selectedToolIndex === index;
+                      return (
+                        <button
+                          key={index}
+                          onClick={() => setSelectedToolIndex(index)}
+                          className={`text-left px-3 py-2 rounded-lg transition-all truncate border shrink-0 ${
+                            isSelected
+                              ? "bg-cyan-950/25 border-cyan-500/50 text-cyan-400 font-bold"
+                              : "bg-transparent border-transparent text-slate-400 hover:text-slate-200 hover:bg-slate-900/30"
+                          }`}
+                          title={tool.name}
+                        >
+                          🔧 {tool.name}
+                        </button>
+                      );
+                    })}
+                  {log.tools.filter((t) =>
+                    t.name
+                      .toLowerCase()
+                      .includes(toolSearchQuery.toLowerCase()),
+                  ).length === 0 && (
+                    <div className="text-center text-slate-500 py-6 text-[10px]">
+                      未找到相关工具
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {(() => {
+                const selectedTool =
+                  log.tools[selectedToolIndex] || log.tools[0];
+                if (!selectedTool) return null;
+                return (
+                  <div className="flex-1 flex flex-col gap-3 min-w-0 overflow-y-auto">
+                    <div className="p-4 bg-slate-950/20 border border-slate-900 rounded-xl flex flex-col gap-2.5">
+                      <div className="flex items-center gap-2">
+                        <span className="text-[10px] font-bold px-2 py-0.5 bg-cyan-950/80 border border-cyan-900/20 text-cyan-400 rounded-md">
+                          TOOL
+                        </span>
+                        <span className="text-sm font-bold text-slate-200 font-mono">
+                          {selectedTool.name}
+                        </span>
+                      </div>
+                      {selectedTool.description && (
+                        <p className="text-xs text-slate-400 leading-relaxed bg-slate-950/45 p-3 rounded-lg border border-slate-900/60">
+                          <span className="font-semibold text-slate-400 block mb-1">
+                            功能描述：
+                          </span>
+                          {selectedTool.description}
+                        </p>
+                      )}
+                    </div>
+                    <div className="flex flex-col shrink-0">
+                      <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider block mb-1">
+                        Parameters Schema
+                      </span>
+                      <CodeBlock
+                        code={formatJSON(selectedTool.parameters)}
+                        language="parameters.schema.json"
+                      />
+                    </div>
+                  </div>
+                );
+              })()}
+            </div>
+          )}
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   // 视图模式: logs (扁平列表) | sessions (会话列表)
   const [viewMode, setViewMode] = useState("logs");
@@ -423,17 +1348,15 @@ export default function App() {
   const [selectedLogId, setSelectedLogId] = useState(null);
   const [selectedLog, setSelectedLog] = useState(null);
   const [isLogLoading, setIsLogLoading] = useState(false);
-  const [isListLoading, setIsListLoading] = useState(false);
-  const [selectedToolIndex, setSelectedToolIndex] = useState(0);
-  const [toolSearchQuery, setToolSearchQuery] = useState("");
+  const [isLogsLoading, setIsLogsLoading] = useState(false);
+  const [isSessionsLoading, setIsSessionsLoading] = useState(false);
+  // 点击列表卡片时希望 LogDetail 默认展开的 tab：log 卡片 → trace；session 卡片 → session
+  const [inlineDefaultTab, setInlineDefaultTab] = useState("trace");
 
   // 历史详情弹窗状态
   const [modalLogId, setModalLogId] = useState(null);
   const [modalLog, setModalLog] = useState(null);
   const [isModalLoading, setIsModalLoading] = useState(false);
-  const [modalActiveTab, setModalActiveTab] = useState("trace");
-  const [modalSelectedToolIndex, setModalSelectedToolIndex] = useState(0);
-  const [modalToolSearchQuery, setModalToolSearchQuery] = useState("");
 
   // 统计信息
   const [stats, setStats] = useState({
@@ -467,7 +1390,6 @@ export default function App() {
   const [showResponsesKey, setShowResponsesKey] = useState(false);
   const [isConfigSaving, setIsConfigSaving] = useState(false);
   const [copiedText, setCopiedText] = useState("");
-  const [activeTab, setActiveTab] = useState("trace"); // trace, prompt, raw_req, raw_resp
 
   // 系统日志相关的状态
   const [isSystemLogsOpen, setIsSystemLogsOpen] = useState(false);
@@ -476,123 +1398,25 @@ export default function App() {
   const [autoScroll, setAutoScroll] = useState(true);
   const logsContainerRef = useRef(null);
 
-  // 折叠状态控制
-  const [showSystemPrompt, setShowSystemPrompt] = useState(false);
-  const [showToolsDef, setShowToolsDef] = useState(false);
-
-  // 渲染子代理会话的内联时间链
-  const renderSubLogsForTool = (toolCallId, targetLog = selectedLog) => {
-    if (!targetLog || !targetLog.subLogs) return null;
-    const matchingSubLogs = targetLog.subLogs.filter(
-      (sl) => sl.parentToolCallId === toolCallId,
-    );
-    if (matchingSubLogs.length === 0) return null;
-
-    return (
-      <div className="mt-3 border-t border-slate-800/80 pt-3 flex flex-col gap-3 font-sans">
-        <div className="text-[10px] font-bold text-amber-400/90 uppercase tracking-wider flex items-center gap-1.5">
-          <span>↳ 子代理会话执行追踪 (Subagent Trace)</span>
-          <span className="px-1.5 py-0.2 rounded bg-amber-950/50 text-[8px] border border-amber-900/30">
-            共 {matchingSubLogs.length} 条调用
-          </span>
-        </div>
-        <div className="flex flex-col gap-3 pl-3.5 border-l border-amber-500/20">
-          {matchingSubLogs.map((subLog) => (
-            <div
-              key={subLog.id}
-              className="p-3 bg-slate-900/30 border border-slate-800/50 rounded-xl text-xs flex flex-col gap-2.5"
-            >
-              <div className="flex justify-between items-center">
-                <span className="text-[9px] font-mono text-slate-400">
-                  分支日志 #{subLog.id} • {subLog.model}
-                </span>
-                <span className="text-[9px] px-1.5 py-0.5 rounded bg-black/30 font-mono text-orange-400/90">
-                  {(subLog.durationMs / 1000).toFixed(2)}s •{" "}
-                  {subLog.totalTokens} tkn
-                </span>
-              </div>
-
-              {/* 渲染子日志中的消息流（排除system） */}
-              <div className="flex flex-col gap-2">
-                {subLog.prompt &&
-                  subLog.prompt
-                    .filter((p) => p.role !== "system")
-                    .map((m, mIdx) => (
-                      <div
-                        key={mIdx}
-                        className="bg-slate-950/30 p-2.5 rounded-lg border border-slate-900/60 leading-relaxed text-[11px]"
-                      >
-                        <div className="font-bold text-[9px] text-cyan-400/80 mb-1">
-                          {m.role === "user"
-                            ? "👤 User"
-                            : m.role === "tool"
-                              ? "🛠️ Tool Response"
-                              : "🤖 Assistant"}
-                          :
-                        </div>
-                        <div className="text-slate-300 whitespace-pre-wrap">
-                          {m.content}
-                        </div>
-                        {m.tool_calls &&
-                          m.tool_calls.map((tc, tcIdx) => (
-                            <div
-                              key={tcIdx}
-                              className="mt-1.5 p-2 bg-slate-950/80 rounded border border-slate-900 font-mono text-[9px]"
-                            >
-                              <span className="text-orange-400/80">
-                                Call: {tc.name}
-                              </span>
-                              <span className="text-slate-500 block break-all">
-                                Args: {tc.arguments}
-                              </span>
-                            </div>
-                          ))}
-                      </div>
-                    ))}
-
-                {/* 渲染子日志最新回复 */}
-                {subLog.response &&
-                  (subLog.response.content ||
-                    (subLog.response.tool_calls &&
-                      subLog.response.tool_calls.length > 0)) && (
-                    <div className="bg-slate-950/45 p-2.5 rounded-lg border border-slate-900/85 border-l border-l-cyan-500/40 leading-relaxed text-[11px]">
-                      <div className="font-bold text-[9px] text-cyan-400 mb-1">
-                        🤖 Assistant (最新回复):
-                      </div>
-                      {subLog.response.thinking && (
-                        <div className="text-purple-400/80 italic text-[10px] mb-1">
-                          Thinking: {subLog.response.thinking}
-                        </div>
-                      )}
-                      <div className="text-slate-205 whitespace-pre-wrap">
-                        {subLog.response.content}
-                      </div>
-                      {subLog.response.tool_calls &&
-                        subLog.response.tool_calls.map((tc, tcIdx) => (
-                          <div
-                            key={tcIdx}
-                            className="mt-1.5 p-2 bg-slate-950/80 rounded border border-slate-900 font-mono text-[9px]"
-                          >
-                            <span className="text-orange-400/80">
-                              Call: {tc.name}
-                            </span>
-                            <span className="text-slate-500 block break-all">
-                              Args: {tc.arguments}
-                            </span>
-                          </div>
-                        ))}
-                    </div>
-                  )}
-              </div>
-            </div>
-          ))}
-        </div>
-      </div>
-    );
+  // 通用确认/提示对话框（替代 window.confirm / alert，与 glass-panel 风格一致）
+  const [dialog, setDialog] = useState(null); // { type, message, resolve }
+  const requestConfirm = (message) =>
+    new Promise((resolve) => {
+      setDialog({ type: "confirm", message, resolve });
+    });
+  const requestAlert = (message) =>
+    new Promise((resolve) => {
+      setDialog({ type: "alert", message, resolve });
+    });
+  const closeDialog = (result) => {
+    if (dialog?.resolve) dialog.resolve(result);
+    setDialog(null);
   };
 
   // 轮询计数器与定时器引用
   const autoRefreshTimer = useRef(null);
+  // 会话卡片点击时的 fetch controller：新点击会取消旧请求，避免竞态
+  const sessionClickAbort = useRef(null);
 
   // 动态计算本地代理根地址
   const proxyBase = (() => {
@@ -636,14 +1460,11 @@ export default function App() {
 
   const fetchLogs = useCallback(
     async (page = 1) => {
-      setIsListLoading(true);
+      setIsLogsLoading(true);
       try {
         let url = `/api/logs?page=${page}&pageSize=${pageSize}`;
         if (providerFilter !== "all") url += `&provider=${providerFilter}`;
-        if (statusFilter !== "all") {
-          const filterVal = statusFilter === "success" ? 200 : 502; // 后端根据特定状态码过滤
-          url += `&status=${filterVal}`;
-        }
+        if (statusFilter !== "all") url += `&status=${statusFilter}`;
         if (searchKeyword.trim() !== "")
           url += `&keyword=${encodeURIComponent(searchKeyword)}`;
 
@@ -657,7 +1478,7 @@ export default function App() {
       } catch (err) {
         console.error("Failed to fetch logs:", err);
       } finally {
-        setIsListLoading(false);
+        setIsLogsLoading(false);
       }
     },
     [providerFilter, statusFilter, searchKeyword, pageSize],
@@ -665,7 +1486,7 @@ export default function App() {
 
   const fetchSessions = useCallback(
     async (page = 1) => {
-      setIsListLoading(true);
+      setIsSessionsLoading(true);
       try {
         let url = `/api/sessions?page=${page}&pageSize=${sessionPageSize}`;
         if (searchKeyword.trim() !== "")
@@ -681,7 +1502,7 @@ export default function App() {
       } catch (err) {
         console.error("Failed to fetch sessions:", err);
       } finally {
-        setIsListLoading(false);
+        setIsSessionsLoading(false);
       }
     },
     [searchKeyword, sessionPageSize],
@@ -733,7 +1554,7 @@ export default function App() {
   // 删除单个日志
   const handleDeleteLog = async (e, id) => {
     e.stopPropagation(); // 阻止卡片点击展开详情
-    if (!window.confirm("确定要删除这条请求日志吗？该操作不可逆。")) {
+    if (!(await requestConfirm("确定要删除这条请求日志吗？该操作不可逆。"))) {
       return;
     }
 
@@ -750,11 +1571,11 @@ export default function App() {
         fetchLogs(currentPage);
         fetchStats();
       } else {
-        alert("删除请求日志失败");
+        requestAlert("删除请求日志失败");
       }
     } catch (err) {
       console.error("Failed to delete log:", err);
-      alert("删除发生异常");
+      requestAlert("删除发生异常");
     }
   };
 
@@ -762,9 +1583,9 @@ export default function App() {
   const handleDeleteSessionLogs = async (sessionId) => {
     if (!sessionId) return;
     if (
-      !window.confirm(
+      !(await requestConfirm(
         `确定要删除会话 (ID: ${sessionId}) 中的所有请求日志吗？该操作不可逆。`,
-      )
+      ))
     ) {
       return;
     }
@@ -782,11 +1603,11 @@ export default function App() {
         fetchLogs(currentPage);
         fetchStats();
       } else {
-        alert("删除会话日志失败");
+        requestAlert("删除会话日志失败");
       }
     } catch (err) {
       console.error("Failed to delete session logs:", err);
-      alert("删除发生异常");
+      requestAlert("删除发生异常");
     }
   };
 
@@ -806,11 +1627,11 @@ export default function App() {
         setIsSettingsOpen(false);
         fetchConfig();
       } else {
-        alert("配置保存失败");
+        requestAlert("配置保存失败");
       }
     } catch (err) {
       console.error("Failed to save config:", err);
-      alert("保存发生异常");
+      requestAlert("保存发生异常");
     } finally {
       setIsConfigSaving(false);
     }
@@ -835,9 +1656,9 @@ export default function App() {
   // 清空系统运行日志
   const handleClearSystemLogs = async () => {
     if (
-      !window.confirm(
+      !(await requestConfirm(
         "确定要物理清空系统运行日志文件吗？该操作将重置本地 system.log 文件。",
-      )
+      ))
     ) {
       return;
     }
@@ -848,11 +1669,11 @@ export default function App() {
       if (res.ok) {
         setSystemLogs("--- system log cleared ---\n");
       } else {
-        alert("清空系统日志失败");
+        requestAlert("清空系统日志失败");
       }
     } catch (err) {
       console.error("Failed to clear system logs:", err);
-      alert("清空系统日志发生异常");
+      requestAlert("清空系统日志发生异常");
     }
   };
 
@@ -923,16 +1744,17 @@ export default function App() {
     let cancelled = false;
 
     const loop = async () => {
-      // 仅在第一页且没有搜索过滤时自动刷新列表
-      if (viewMode === "logs") {
-        if (currentPage === 1 && searchKeyword.trim() === "") {
-          await fetchLogs(1);
-        }
-      } else {
-        if (currentSessionPage === 1 && searchKeyword.trim() === "") {
-          await fetchSessions(1);
-        }
+      // 仅在第一页且没有搜索过滤时自动刷新列表；窗口未聚焦时跳过刷新避免吹掉 hover/操作
+      const shouldRefreshList =
+        document.hasFocus() &&
+        searchKeyword.trim() === "" &&
+        ((viewMode === "logs" && currentPage === 1) ||
+          (viewMode === "sessions" && currentSessionPage === 1));
+      if (shouldRefreshList) {
+        if (viewMode === "logs") await fetchLogs(1);
+        else await fetchSessions(1);
       }
+      // 统计数据轻量，无焦点时也照常拉取
       await fetchStats();
 
       if (!cancelled) {
@@ -962,8 +1784,6 @@ export default function App() {
   useEffect(() => {
     if (selectedLogId) {
       fetchLogDetail(selectedLogId);
-      setSelectedToolIndex(0);
-      setToolSearchQuery("");
     } else {
       setSelectedLog(null);
       setSessionLogs([]);
@@ -980,9 +1800,6 @@ export default function App() {
           if (res.ok) {
             const data = await res.json();
             setModalLog(data);
-            setModalActiveTab("trace"); // 默认切到 trace tab
-            setModalSelectedToolIndex(0);
-            setModalToolSearchQuery("");
           }
         } catch (err) {
           console.error("Failed to fetch modal log detail:", err);
@@ -999,12 +1816,17 @@ export default function App() {
   useEffect(() => {
     const handleKeyDown = (e) => {
       if (e.key === "Escape") {
-        setModalLogId(null);
+        if (dialog) {
+          closeDialog(false);
+        } else {
+          setModalLogId(null);
+        }
       }
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dialog]);
 
   // 页码切换
   const handlePageChange = (newPage) => {
@@ -1050,7 +1872,7 @@ export default function App() {
               {!isModalLoading && modalLog && (
                 <span className="text-[10px] text-slate-500 font-mono truncate">
                   {modalLog.sessionId
-                    ? `会话 #${modalLog.sessionSeq} (ID: ${modalLog.id})`
+                    ? `会话 ${shortSessionId(modalLog.sessionId)} #${modalLog.sessionSeq} · ID ${modalLog.id}`
                     : `ID: ${modalLog.id}`}{" "}
                   • Path: {modalLog.path}
                 </span>
@@ -1058,580 +1880,19 @@ export default function App() {
             </div>
             <button
               onClick={() => setModalLogId(null)}
-              className="text-slate-450 hover:text-slate-200 text-2xl font-light transition-colors active:scale-95 leading-none w-8 h-8 flex items-center justify-center rounded-full hover:bg-slate-900/50"
+              className="text-slate-400 hover:text-slate-200 text-2xl font-light transition-colors active:scale-95 leading-none w-8 h-8 flex items-center justify-center rounded-full hover:bg-slate-900/50"
             >
               &times;
             </button>
           </div>
 
-          {/* 内容区 */}
+          {/* 内容区：委托给 LogDetail（与右栏 inline 详情共用同一份渲染） */}
           <div className="flex-1 overflow-y-auto p-6 flex flex-col gap-6 min-h-0">
-            {isModalLoading ? (
-              <div className="flex-1 flex flex-col items-center justify-center text-slate-500 gap-4">
-                <IconRefresh className="animate-spin text-cyan-400 w-8 h-8" />
-                <p className="text-xs font-medium tracking-wide">
-                  加载请求结构化详情中...
-                </p>
-              </div>
-            ) : !modalLog ? (
-              <div className="flex-1 flex flex-col items-center justify-center text-red-400 gap-3">
-                <span>加载日志失败，请稍后重试</span>
-              </div>
-            ) : (
-              <div className="flex-1 flex flex-col overflow-hidden gap-6 min-h-0">
-                {/* 详情头部元数据卡片 (Grid 布局，突出核心指标) */}
-                <div className="p-5 bg-slate-950/35 border border-slate-900/60 rounded-2xl flex flex-col gap-4 lg:flex-row lg:justify-between lg:items-center shrink-0">
-                  <div className="flex flex-col gap-1 min-w-0">
-                    <span className="text-xs font-semibold text-slate-305 font-sans">
-                      运行指标摘要 (Run Metrics)
-                    </span>
-                    <span className="text-[10px] text-slate-500 font-mono">
-                      开始时间: {modalLog.createdAt}
-                    </span>
-                  </div>
-
-                  <div
-                    className={`grid grid-cols-2 ${modalLog.cachedTokens > 0 || modalLog.cacheReadTokens > 0 || modalLog.cacheCreationTokens > 0 ? "sm:grid-cols-5" : "sm:grid-cols-4"} gap-3 text-xs font-mono shrink-0`}
-                  >
-                    <div className="flex flex-col items-start lg:items-end px-3.5 py-2 rounded-xl bg-orange-950/15 border border-orange-900/15">
-                      <span className="text-[9px] text-slate-500 font-medium uppercase tracking-wider mb-0.5 font-sans">
-                        请求耗时
-                      </span>
-                      <span className="font-bold text-sm text-orange-400">
-                        {(modalLog.durationMs / 1000).toFixed(2)}s
-                      </span>
-                    </div>
-                    <div className="flex flex-col items-start lg:items-end px-3.5 py-2 rounded-xl bg-cyan-950/15 border border-cyan-900/15">
-                      <span className="text-[9px] text-slate-500 font-medium uppercase tracking-wider mb-0.5 font-sans">
-                        输入 Tokens
-                      </span>
-                      <span className="font-bold text-sm text-cyan-400">
-                        {modalLog.inputTokens}
-                      </span>
-                      {modalLog.cachedTokens > 0 && (
-                        <span className="text-[8px] text-slate-450 mt-0.5">
-                          实际计算:{" "}
-                          {modalLog.inputTokens - modalLog.cachedTokens}
-                        </span>
-                      )}
-                    </div>
-                    {(modalLog.cachedTokens > 0 ||
-                      modalLog.cacheReadTokens > 0 ||
-                      modalLog.cacheCreationTokens > 0) && (
-                      <div className="flex flex-col items-start lg:items-end px-3.5 py-2 rounded-xl bg-indigo-950/20 border border-indigo-900/30 text-indigo-400">
-                        <span className="text-[9px] text-slate-500 font-medium uppercase tracking-wider mb-0.5 font-sans">
-                          缓存 Tokens
-                        </span>
-                        <span className="font-bold text-sm text-indigo-400">
-                          {modalLog.cachedTokens}
-                        </span>
-                        <span className="text-[8px] text-slate-450 mt-0.5 truncate max-w-full">
-                          {modalLog.provider === "openai" ||
-                          modalLog.provider === "openai-responses"
-                            ? "命中缓存"
-                            : `读缓存 (另写 ${modalLog.cacheCreationTokens})`}
-                        </span>
-                      </div>
-                    )}
-                    <div className="flex flex-col items-start lg:items-end px-3.5 py-2 rounded-xl bg-purple-950/15 border border-purple-900/15">
-                      <span className="text-[9px] text-slate-500 font-medium uppercase tracking-wider mb-0.5 font-sans">
-                        输出 Tokens
-                      </span>
-                      <span className="font-bold text-sm text-purple-400">
-                        {modalLog.outputTokens}
-                      </span>
-                    </div>
-                    <div
-                      className={`flex flex-col items-start lg:items-end px-3.5 py-2 rounded-xl border ${
-                        modalLog.statusCode >= 200 && modalLog.statusCode < 300
-                          ? "bg-emerald-950/15 border-emerald-900/15 text-emerald-400"
-                          : "bg-red-950/15 border-red-900/15 text-red-400"
-                      }`}
-                    >
-                      <span className="text-[9px] text-slate-500 font-medium uppercase tracking-wider mb-0.5 font-sans">
-                        状态代码
-                      </span>
-                      <span className="font-bold text-sm">
-                        {modalLog.statusCode}
-                      </span>
-                    </div>
-                  </div>
-                </div>
-
-                {/* 时序控制 Tab */}
-                <div className="flex border-b border-slate-900 pb-1 gap-6 shrink-0">
-                  <button
-                    onClick={() => setModalActiveTab("trace")}
-                    className={`pb-2.5 text-xs font-bold border-b-2 transition-all ${
-                      modalActiveTab === "trace"
-                        ? "border-cyan-400 text-cyan-400 drop-shadow-[0_0_8px_rgba(6,182,212,0.3)]"
-                        : "border-transparent text-slate-400 hover:text-slate-200"
-                    }`}
-                  >
-                    时序追踪 (Trace)
-                  </button>
-                  <button
-                    onClick={() => setModalActiveTab("prompt")}
-                    className={`pb-2.5 text-xs font-bold border-b-2 transition-all ${
-                      modalActiveTab === "prompt"
-                        ? "border-cyan-400 text-cyan-400 drop-shadow-[0_0_8px_rgba(6,182,212,0.3)]"
-                        : "border-transparent text-slate-400 hover:text-slate-200"
-                    }`}
-                  >
-                    请求消息 (
-                    {modalLog.prompt
-                      ? modalLog.prompt.filter((p) => p.role !== "system")
-                          .length
-                      : 0}
-                    )
-                  </button>
-                  {modalLog.tools && modalLog.tools.length > 0 && (
-                    <button
-                      onClick={() => setModalActiveTab("tools")}
-                      className={`pb-2.5 text-xs font-bold border-b-2 transition-all ${
-                        modalActiveTab === "tools"
-                          ? "border-cyan-400 text-cyan-400 drop-shadow-[0_0_8px_rgba(6,182,212,0.3)]"
-                          : "border-transparent text-slate-400 hover:text-slate-200"
-                      }`}
-                    >
-                      定义的工具 ({modalLog.tools.length})
-                    </button>
-                  )}
-                  <button
-                    onClick={() => setModalActiveTab("raw_req")}
-                    className={`pb-2.5 text-xs font-bold border-b-2 transition-all ${
-                      modalActiveTab === "raw_req"
-                        ? "border-cyan-400 text-cyan-400 drop-shadow-[0_0_8px_rgba(6,182,212,0.3)]"
-                        : "border-transparent text-slate-400 hover:text-slate-200"
-                    }`}
-                  >
-                    原始请求 JSON
-                  </button>
-                  <button
-                    onClick={() => setModalActiveTab("raw_resp")}
-                    className={`pb-2.5 text-xs font-bold border-b-2 transition-all ${
-                      modalActiveTab === "raw_resp"
-                        ? "border-cyan-400 text-cyan-400 drop-shadow-[0_0_8px_rgba(6,182,212,0.3)]"
-                        : "border-transparent text-slate-400 hover:text-slate-200"
-                    }`}
-                  >
-                    原始响应 Raw
-                  </button>
-                </div>
-
-                {/* Tab 内容区 */}
-                <div className="flex-1 overflow-y-auto pr-1.5 min-h-0 flex flex-col gap-4 scroll-isolated">
-                  {/* 1. 时序追踪 (Trace) */}
-                  {modalActiveTab === "trace" && (
-                    <div className="flex flex-col gap-5">
-                      {/* 可视化分段 Timeline */}
-                      <div className="p-4 bg-slate-950/20 border border-slate-900 rounded-xl flex flex-col gap-3">
-                        <div className="flex justify-between items-center text-xs text-slate-400 font-mono">
-                          <span className="font-semibold text-slate-300 font-sans">
-                            时序可视化时间线
-                          </span>
-                          <span className="text-cyan-400 font-bold">
-                            {(modalLog.durationMs / 1000).toFixed(2)}s
-                          </span>
-                        </div>
-
-                        {/* 分段时间条 */}
-                        <div className="h-7 w-full bg-slate-950/80 rounded-lg overflow-hidden flex relative p-0.5 border border-slate-900">
-                          <div
-                            className="h-full bg-indigo-600/40 rounded-l-md border-r border-slate-900/30 flex items-center justify-center text-[8px] font-bold text-indigo-300 shrink-0 font-sans"
-                            style={{
-                              width: `${Math.min(15, Math.max(5, (150 / modalLog.durationMs) * 100))}%`,
-                            }}
-                          >
-                            连接
-                          </div>
-                          <div
-                            className="h-full timeline-shimmer rounded-r-md"
-                            style={{ flex: 1 }}
-                          />
-                          <div className="absolute inset-0 flex justify-end items-center pr-4 text-[9px] font-bold text-white uppercase tracking-wider drop-shadow-md font-sans">
-                            <span>
-                              传输流 • {(modalLog.durationMs / 1000).toFixed(2)}
-                              s
-                            </span>
-                          </div>
-                        </div>
-
-                        {/* 如果有工具调用，显示时序序列图 */}
-                        {modalLog.response &&
-                          modalLog.response.tool_calls &&
-                          modalLog.response.tool_calls.length > 0 && (
-                            <div className="mt-1.5 flex flex-col gap-2.5">
-                              <span className="text-[10px] text-slate-500 uppercase font-bold tracking-wider font-sans">
-                                执行的 Tool Call Spans
-                              </span>
-                              <div className="flex flex-col gap-2">
-                                {modalLog.response.tool_calls.map((tc, idx) => (
-                                  <div
-                                    key={idx}
-                                    className="flex items-center justify-between px-3 py-2.5 bg-slate-950/40 border border-slate-900 rounded-xl text-xs"
-                                  >
-                                    <div className="flex items-center gap-2 min-w-0 font-sans">
-                                      <span className="text-[9px] font-bold px-2 py-0.5 bg-orange-950/80 border border-orange-900/20 text-orange-400 rounded-md shrink-0">
-                                        TOOL
-                                      </span>
-                                      <span className="font-mono text-slate-200 font-semibold truncate">
-                                        {tc.name}
-                                      </span>
-                                    </div>
-                                    <span className="text-[9px] text-slate-500 font-mono shrink-0">
-                                      id: {tc.id}
-                                    </span>
-                                  </div>
-                                ))}
-                              </div>
-                            </div>
-                          )}
-                      </div>
-                    </div>
-                  )}
-
-                  {/* 2. 对话结构化展示 */}
-                  {modalActiveTab === "prompt" && (
-                    <div className="flex flex-col gap-4">
-                      {/* 折叠 System Prompt */}
-                      <div className="flex flex-col gap-2.5">
-                        <button
-                          onClick={() => setShowSystemPrompt(!showSystemPrompt)}
-                          className="flex justify-between items-center px-4 py-3 bg-slate-950/40 hover:bg-slate-900/60 border border-slate-900/85 rounded-xl text-xs text-slate-300 transition-all active:scale-[0.99] font-sans"
-                        >
-                          <span className="flex items-center gap-2">
-                            <IconTerminal />
-                            <span className="font-semibold">System 提示词</span>
-                          </span>
-                          <span className="text-slate-455">
-                            {showSystemPrompt ? (
-                              <IconChevronDown />
-                            ) : (
-                              <IconChevronRight />
-                            )}
-                          </span>
-                        </button>
-                        {showSystemPrompt && (
-                          <div className="p-4 bg-slate-950/60 border border-slate-900 rounded-xl text-xs font-mono text-slate-400 whitespace-pre-wrap leading-relaxed">
-                            {modalLog.prompt &&
-                            modalLog.prompt.filter((p) => p.role === "system")
-                              .length > 0
-                              ? modalLog.prompt
-                                  .filter((p) => p.role === "system")
-                                  .map((p) => p.content)
-                                  .join("\n")
-                              : "无系统提示词"}
-                          </div>
-                        )}
-                      </div>
-
-                      {/* 消息时间线 */}
-                      <div className="flex flex-col gap-4 font-sans">
-                        <h3 className="text-xs uppercase font-bold tracking-wider text-slate-400">
-                          消息流记录
-                        </h3>
-                        {modalLog.prompt &&
-                          modalLog.prompt
-                            .filter((p) => p.role !== "system")
-                            .map((m, idx) => {
-                              const isUser = m.role === "user";
-                              const isTool = m.role === "tool";
-                              const isAssistant = m.role === "assistant";
-
-                              return (
-                                <div
-                                  key={idx}
-                                  className={`p-5 rounded-2xl border flex flex-col gap-3.5 shadow-sm ${
-                                    isUser
-                                      ? "bg-cyan-950/10 border-cyan-950/40"
-                                      : isTool
-                                        ? "bg-orange-950/10 border-orange-950/40"
-                                        : "bg-slate-950/25 border-slate-900"
-                                  }`}
-                                >
-                                  <div className="flex justify-between items-center">
-                                    <span
-                                      className={`text-[10px] font-bold uppercase tracking-wider px-2.5 py-1 rounded-md border ${
-                                        isUser
-                                          ? "bg-cyan-950/60 border-cyan-900/30 text-cyan-400"
-                                          : isTool
-                                            ? "bg-orange-950/60 border-orange-900/30 text-orange-400"
-                                            : "bg-slate-900/60 border-slate-800/80 text-cyan-400"
-                                      }`}
-                                    >
-                                      {isUser
-                                        ? "👤 User"
-                                        : isTool
-                                          ? "🛠️ Tool Response"
-                                          : "🤖 Assistant"}
-                                      {m.name && (
-                                        <span className="text-slate-400 font-mono text-[9px] ml-1">
-                                          ({m.name})
-                                        </span>
-                                      )}
-                                    </span>
-                                    {m.tool_call_id && (
-                                      <span className="text-[9px] text-slate-500 font-mono">
-                                        ID: {m.tool_call_id}
-                                      </span>
-                                    )}
-                                  </div>
-
-                                  {/* 思维链 */}
-                                  {isAssistant && m.thinking && (
-                                    <div className="p-3.5 bg-slate-900/40 border border-slate-850/60 rounded-xl text-xs text-slate-450/90 italic whitespace-pre-wrap border-l-2 border-l-purple-500/60">
-                                      <div className="text-[9px] font-bold text-purple-400 uppercase tracking-wider not-italic mb-1 font-sans">
-                                        思考过程 (Thinking)
-                                      </div>
-                                      {m.thinking}
-                                    </div>
-                                  )}
-
-                                  {m.content && (
-                                    <div className="text-sm leading-relaxed tracking-wide text-slate-200 whitespace-pre-wrap mt-0.5">
-                                      {m.content}
-                                    </div>
-                                  )}
-
-                                  {/* 工具调用展示 */}
-                                  {isAssistant &&
-                                    m.tool_calls &&
-                                    m.tool_calls.length > 0 && (
-                                      <div className="mt-1 flex flex-col gap-2 font-mono">
-                                        <div className="text-[9px] font-bold text-orange-400 uppercase tracking-wider font-sans">
-                                          触发工具调用 (Tool Calls)
-                                        </div>
-                                        {m.tool_calls.map((tc, tcIdx) => (
-                                          <div
-                                            key={tcIdx}
-                                            className="p-3 bg-slate-950/40 border border-slate-900 rounded-xl text-xs text-slate-300 font-sans"
-                                          >
-                                            <div>
-                                              <span className="text-slate-500 font-mono">
-                                                Method:
-                                              </span>{" "}
-                                              <span className="text-orange-400 font-semibold font-mono">
-                                                {tc.name}
-                                              </span>
-                                            </div>
-                                            <div className="mt-1">
-                                              <span className="text-slate-500 font-mono">
-                                                Args:
-                                              </span>{" "}
-                                              <span className="text-emerald-400/90 font-mono">
-                                                {tc.arguments}
-                                              </span>
-                                            </div>
-                                            {renderSubLogsForTool(
-                                              tc.id,
-                                              modalLog,
-                                            )}
-                                          </div>
-                                        ))}
-                                      </div>
-                                    )}
-                                </div>
-                              );
-                            })}
-
-                        {/* 渲染当次最新大模型回复 */}
-                        {modalLog.response &&
-                          (modalLog.response.content ||
-                            modalLog.response.thinking ||
-                            (modalLog.response.tool_calls &&
-                              modalLog.response.tool_calls.length > 0)) && (
-                            <div className="p-5 rounded-2xl border flex flex-col gap-3.5 shadow-sm bg-slate-950/25 border-slate-900 border-l-[3px] border-l-cyan-500/50">
-                              <div className="flex justify-between items-center">
-                                <span className="text-[10px] font-bold uppercase tracking-wider px-2.5 py-1 rounded-md border bg-slate-900/60 border-slate-800/80 text-cyan-400">
-                                  🤖 Assistant (最新回复)
-                                </span>
-                              </div>
-
-                              {/* 思维链 */}
-                              {modalLog.response.thinking && (
-                                <div className="p-3.5 bg-slate-900/40 border border-slate-850/60 rounded-xl text-xs text-slate-450/90 italic whitespace-pre-wrap border-l-2 border-l-purple-500/60">
-                                  <div className="text-[9px] font-bold text-purple-400 uppercase tracking-wider not-italic mb-1">
-                                    思考过程 (Thinking)
-                                  </div>
-                                  {modalLog.response.thinking}
-                                </div>
-                              )}
-
-                              {/* 消息正文 */}
-                              {modalLog.response.content && (
-                                <div className="text-sm leading-relaxed tracking-wide text-slate-200 whitespace-pre-wrap mt-0.5">
-                                  {modalLog.response.content}
-                                </div>
-                              )}
-
-                              {/* 工具调用展示 */}
-                              {modalLog.response.tool_calls &&
-                                modalLog.response.tool_calls.length > 0 && (
-                                  <div className="mt-1 flex flex-col gap-2 font-mono">
-                                    <div className="text-[9px] font-bold text-orange-400 uppercase tracking-wider font-sans">
-                                      触发工具调用 (Tool Calls)
-                                    </div>
-                                    {modalLog.response.tool_calls.map(
-                                      (tc, tcIdx) => (
-                                        <div
-                                          key={tcIdx}
-                                          className="p-3 bg-slate-950/40 border border-slate-900 rounded-xl text-xs text-slate-300 font-sans"
-                                        >
-                                          <div>
-                                            <span className="text-slate-500 font-mono">
-                                              Method:
-                                            </span>{" "}
-                                            <span className="text-orange-400 font-semibold font-mono">
-                                              {tc.name}
-                                            </span>
-                                          </div>
-                                          <div className="mt-1">
-                                            <span className="text-slate-500 font-mono">
-                                              Args:
-                                            </span>{" "}
-                                            <span className="text-emerald-400/90 font-mono">
-                                              {tc.arguments}
-                                            </span>
-                                          </div>
-                                          {renderSubLogsForTool(
-                                            tc.id,
-                                            modalLog,
-                                          )}
-                                        </div>
-                                      ),
-                                    )}
-                                  </div>
-                                )}
-                            </div>
-                          )}
-                      </div>
-                    </div>
-                  )}
-
-                  {/* 3. 原始请求 Raw */}
-                  {modalActiveTab === "raw_req" && (
-                    <CodeBlock
-                      code={formatJSON(modalLog.rawRequest)}
-                      language="Raw HTTP Request Body"
-                    />
-                  )}
-
-                  {/* 4. 原始响应 Raw */}
-                  {modalActiveTab === "raw_resp" && (
-                    <CodeBlock
-                      code={formatJSON(modalLog.rawResponse)}
-                      language="Raw Upstream Response"
-                    />
-                  )}
-
-                  {/* 5. 已定义工具 (Tools) */}
-                  {modalActiveTab === "tools" &&
-                    modalLog.tools &&
-                    modalLog.tools.length > 0 && (
-                      <div className="flex flex-col lg:flex-row gap-5 flex-1 min-h-0 h-full overflow-hidden font-sans">
-                        {/* 左侧：工具搜索与列表 */}
-                        <div className="w-full lg:w-[240px] flex flex-col gap-3 shrink-0 bg-slate-950/20 border border-slate-900/40 p-3.5 rounded-2xl min-h-0 overflow-y-auto">
-                          <div className="relative flex items-center">
-                            <span className="absolute left-3.5 text-slate-500">
-                              <IconSearch />
-                            </span>
-                            <input
-                              type="text"
-                              placeholder="搜索工具名..."
-                              value={modalToolSearchQuery}
-                              onChange={(e) => {
-                                setModalToolSearchQuery(e.target.value);
-                                setModalSelectedToolIndex(0);
-                              }}
-                              className="w-full pl-9 pr-3.5 py-1.5 bg-slate-950/40 focus:bg-slate-950/85 text-[11px] border border-slate-850/85 focus:border-cyan-500/60 rounded-lg outline-none placeholder:text-slate-500 text-slate-200"
-                            />
-                          </div>
-
-                          {/* 工具列表 */}
-                          <div className="flex flex-col gap-1.5 overflow-y-auto flex-1 pr-1 font-mono text-[11px]">
-                            {modalLog.tools
-                              .map((tool, index) => ({ tool, index }))
-                              .filter(({ tool }) =>
-                                tool.name
-                                  .toLowerCase()
-                                  .includes(modalToolSearchQuery.toLowerCase()),
-                              )
-                              .map(({ tool, index }) => {
-                                const isSelected =
-                                  modalSelectedToolIndex === index;
-                                return (
-                                  <button
-                                    key={index}
-                                    onClick={() =>
-                                      setModalSelectedToolIndex(index)
-                                    }
-                                    className={`text-left px-3 py-2 rounded-lg transition-all truncate border shrink-0 ${
-                                      isSelected
-                                        ? "bg-cyan-950/25 border-cyan-500/50 text-cyan-400 font-bold"
-                                        : "bg-transparent border-transparent text-slate-400 hover:text-slate-200 hover:bg-slate-900/30"
-                                    }`}
-                                    title={tool.name}
-                                  >
-                                    🔧 {tool.name}
-                                  </button>
-                                );
-                              })}
-                            {modalLog.tools.filter((t) =>
-                              t.name
-                                .toLowerCase()
-                                .includes(modalToolSearchQuery.toLowerCase()),
-                            ).length === 0 && (
-                              <div className="text-center text-slate-500 py-6 text-[10px] font-sans">
-                                未找到相关工具
-                              </div>
-                            )}
-                          </div>
-                        </div>
-
-                        {/* 右侧：被选中工具的 Schema 和详情 */}
-                        {(() => {
-                          const selectedTool =
-                            modalLog.tools[modalSelectedToolIndex] ||
-                            modalLog.tools[0];
-                          if (!selectedTool) return null;
-                          return (
-                            <div className="flex-1 flex flex-col gap-3 min-w-0 overflow-y-auto">
-                              <div className="p-4 bg-slate-950/20 border border-slate-900 rounded-xl flex flex-col gap-2.5">
-                                <div className="flex items-center gap-2">
-                                  <span className="text-[10px] font-bold px-2 py-0.5 bg-cyan-950/80 border border-cyan-900/20 text-cyan-400 rounded-md">
-                                    TOOL
-                                  </span>
-                                  <span className="text-sm font-bold text-slate-200 font-mono">
-                                    {selectedTool.name}
-                                  </span>
-                                </div>
-                                {selectedTool.description && (
-                                  <p className="text-xs text-slate-400 leading-relaxed bg-slate-950/45 p-3 rounded-lg border border-slate-900/60">
-                                    <span className="font-semibold text-slate-350 block mb-1">
-                                      功能描述：
-                                    </span>
-                                    {selectedTool.description}
-                                  </p>
-                                )}
-                              </div>
-                              <div className="flex flex-col shrink-0">
-                                <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider block mb-1">
-                                  Parameters Schema
-                                </span>
-                                <CodeBlock
-                                  code={formatJSON(selectedTool.parameters)}
-                                  language="parameters.schema.json"
-                                />
-                              </div>
-                            </div>
-                          );
-                        })()}
-                      </div>
-                    )}
-                </div>
-              </div>
-            )}
+            <LogDetail
+              log={modalLog}
+              isLoading={isModalLoading}
+              onOpenSubLog={setModalLogId}
+            />
           </div>
         </div>
       </div>
@@ -1649,20 +1910,6 @@ export default function App() {
           : log.provider === "openai-responses"
             ? "Responses"
             : log.provider;
-    const tokenStr =
-      log.totalTokens >= 1000
-        ? `${(log.totalTokens / 1000).toFixed(1)}K`
-        : log.totalTokens;
-
-    const uncachedTokens = log.totalTokens - log.cachedTokens;
-    const uncachedTokenStr =
-      uncachedTokens >= 1000
-        ? `${(uncachedTokens / 1000).toFixed(1)}K`
-        : uncachedTokens;
-    const actualTokenTitle =
-      log.cachedTokens > 0
-        ? `未缓存实际计算 Token: ${uncachedTokens}`
-        : `实际计算 Token: ${uncachedTokens}`;
 
     const isBranch = !!log.parentToolCallId;
 
@@ -1672,37 +1919,42 @@ export default function App() {
         onClick={(e) => {
           e.stopPropagation();
           setSelectedLogId(log.id);
-          // 在请求列表模式下，点击卡片通常是为了看单条 Trace
-          if (activeTab === "session") {
-            setActiveTab("trace");
-          }
+          // 点击列表卡片通常是为了看单条 Trace，确保 LogDetail 落在 trace tab
+          setInlineDefaultTab("trace");
         }}
         className={`pl-3 pr-4 py-3.5 rounded-xl cursor-pointer border transition-all flex flex-col gap-2 my-2.5 group ${
           isBranch
             ? "ml-4 bg-slate-900/35 border-amber-900/30"
-            : "bg-slate-950/25 border-slate-900/80 hover:bg-slate-900/40 hover:border-slate-800/80"
+            : !isSuccess
+              ? "bg-red-950/15 border-red-900/40 hover:bg-red-950/25 hover:border-red-800/60"
+              : "bg-slate-950/25 border-slate-900/80 hover:bg-slate-900/40 hover:border-slate-800/80"
         } ${
           isSelected
             ? "bg-slate-900/80 border-cyan-500/60 shadow-[0_0_15px_rgba(6,182,212,0.15)] translate-x-0.5"
             : ""
-        } ${isSuccess ? "border-l-[3px] border-l-emerald-500/80" : "border-l-[3px] border-l-red-500/80"}`}
+        }`}
       >
-        <div className="flex justify-between items-center">
-          <div className="flex items-center gap-2">
+        <div className="flex justify-between items-center gap-2">
+          <div className="flex items-center gap-2 min-w-0">
             {isBranch && (
               <span className="text-[9px] font-bold text-amber-400 bg-amber-950/40 border border-amber-900/30 px-1.5 py-0.5 rounded flex items-center gap-1 shrink-0">
                 ↳ 子分支 #{log.parentId}
               </span>
             )}
-            <span className="text-[9px] uppercase font-bold text-cyan-400/90 tracking-wide px-1.5 py-0.5 rounded bg-cyan-950/40 border border-cyan-900/30">
+            <span className="text-[9px] uppercase font-bold text-slate-400 tracking-wide px-1.5 py-0.5 rounded bg-slate-900/60 border border-slate-800 shrink-0">
               {provName}
             </span>
-            <span className="text-[9px] text-slate-500 font-mono">
-              {log.sessionId ? `会话 #${log.sessionSeq}` : `#${log.id}`}
+            <span className="text-[9px] text-slate-500 font-mono truncate">
+              {log.sessionId
+                ? `会话 ${shortSessionId(log.sessionId)} #${log.sessionSeq}`
+                : `#${log.id}`}
             </span>
           </div>
           <div className="flex items-center gap-2 shrink-0">
-            <span className="text-[9px] text-slate-400/80 code-font group-hover:hidden">
+            <span
+              className="text-[9px] text-slate-400/80 code-font group-hover:hidden"
+              title={log.createdAt || ""}
+            >
               {log.createdAt ? log.createdAt.split(" ")[1] : ""}
             </span>
             <button
@@ -1719,42 +1971,42 @@ export default function App() {
           {log.model}
         </div>
 
-        <div className="flex justify-between items-center text-[9px] text-slate-400 code-font whitespace-nowrap">
-          <div className="flex items-center gap-3">
-            {/* 耗时 (时钟图标) */}
-            <div
-              className="flex items-center gap-1 text-orange-400/80"
-              title="请求耗时"
+        {/* 指标块：第一行 耗时+状态码（成果），第二行 三项 token 指标 */}
+        <div className="flex flex-col gap-1 text-[11px] code-font">
+          <div className="flex justify-between items-center">
+            <span className="text-amber-400/80" title="请求耗时">
+              耗时 {(log.durationMs / 1000).toFixed(2)}s
+            </span>
+            <span
+              className={`font-bold px-1.5 py-0.5 rounded ${
+                isSuccess
+                  ? "text-emerald-400 bg-emerald-950/30"
+                  : "text-red-400 bg-red-950/40"
+              }`}
             >
-              <IconClock />
-              <span>{(log.durationMs / 1000).toFixed(2)}s</span>
-            </div>
-
-            {/* 总吞吐 (CPU图标) */}
-            <div
-              className="flex items-center gap-1 text-purple-400/80"
-              title={`总吞吐 Token: ${log.totalTokens}`}
-            >
-              <IconCpu />
-              <span>{tokenStr}</span>
-            </div>
-
-            {/* 实际计算/未缓存 (火焰图标) */}
-            {log.totalTokens > 0 && (
-              <div
-                className="flex items-center gap-0.5 text-orange-400/80"
-                title={actualTokenTitle}
-              >
-                <IconFlame />
-                <span>{uncachedTokenStr}</span>
-              </div>
-            )}
+              {log.statusCode}
+            </span>
           </div>
-          <span
-            className={`font-bold px-1 py-0.5 rounded bg-black/10 shrink-0 ${isSuccess ? "text-emerald-400" : "text-red-400"}`}
-          >
-            {log.statusCode}
-          </span>
+          <div className="flex items-center gap-2 font-mono">
+            <span
+              className="text-orange-400/80"
+              title={`未缓存输入 Token: ${log.inputTokens - log.cachedTokens}`}
+            >
+              未缓 {formatTokenCount(log.inputTokens - log.cachedTokens)}
+            </span>
+            <span
+              className="text-cyan-400/80"
+              title={`缓存输入 Token: ${log.cachedTokens}`}
+            >
+              缓存 {formatTokenCount(log.cachedTokens)}
+            </span>
+            <span
+              className="text-indigo-400/80"
+              title={`输出 Token: ${log.outputTokens}`}
+            >
+              输出 {formatTokenCount(log.outputTokens)}
+            </span>
+          </div>
         </div>
       </div>
     );
@@ -1776,15 +2028,29 @@ export default function App() {
             setSelectedLogId(
               parseInt(session.sessionId.replace("standalone-", "")),
             );
-            setActiveTab("trace");
+            setInlineDefaultTab("trace");
           } else {
+            // 取消上一次未完成的会话点击请求，避免快速切换时旧响应覆盖新选中
+            if (sessionClickAbort.current) {
+              sessionClickAbort.current.abort();
+            }
+            const controller = new AbortController();
+            sessionClickAbort.current = controller;
             // 获取会话的第一条日志作为详情展示
-            fetch(`/api/sessions/${session.sessionId}/logs`)
+            fetch(`/api/sessions/${session.sessionId}/logs`, {
+              signal: controller.signal,
+            })
               .then((res) => res.json())
               .then((logs) => {
                 if (logs && logs.length > 0) {
                   setSelectedLogId(logs[0].id);
-                  setActiveTab("session"); // 会话模式点击后，右侧默认展示会话历史（时间轴）
+                  // 会话模式点击后，右侧默认展示会话历史（时间轴）
+                  setInlineDefaultTab("session");
+                }
+              })
+              .catch((err) => {
+                if (err.name !== "AbortError") {
+                  console.error("Failed to fetch session logs:", err);
                 }
               });
           }
@@ -1792,20 +2058,12 @@ export default function App() {
         className={`group relative p-4 rounded-2xl border transition-all cursor-pointer ${
           isSelected
             ? "bg-slate-900 border-indigo-500/50 shadow-[0_0_15px_rgba(99,102,241,0.15)] ring-1 ring-indigo-500/30"
-            : "bg-slate-950/40 border-slate-850 hover:bg-slate-900/60 hover:border-slate-800"
+            : "bg-slate-950/40 border-slate-800 hover:bg-slate-900/60 hover:border-slate-800"
         }`}
       >
         <div className="flex justify-between items-start mb-2">
           <div className="flex gap-2">
-            <span
-              className={`px-2 py-0.5 rounded text-[9px] font-bold uppercase tracking-wider ${
-                session.provider === "openai"
-                  ? "bg-emerald-500/20 text-emerald-400 border border-emerald-500/20"
-                  : session.provider === "anthropic"
-                    ? "bg-amber-500/20 text-amber-400 border border-emerald-500/20"
-                    : "bg-indigo-500/20 text-indigo-400 border border-indigo-500/20"
-              }`}
-            >
+            <span className="px-2 py-0.5 rounded text-[9px] font-bold uppercase tracking-wider bg-slate-900/60 text-slate-400 border border-slate-800">
               {session.provider}
             </span>
             <span className="px-2 py-0.5 rounded bg-slate-900 text-slate-400 border border-slate-800 text-[9px] font-mono">
@@ -1841,15 +2099,31 @@ export default function App() {
               </span>
             </div>
           </div>
-          <div className="flex items-center gap-3">
-            <div className="flex items-center gap-1 text-[10px] text-indigo-400/90 font-mono">
-              <span className="text-slate-500 font-sans">消息:</span>
+          <div className="flex items-center gap-2 text-[11px] font-mono">
+            <span className="text-indigo-400/90">
+              <span className="text-slate-500 font-sans">消息 </span>
               {session.messageCount}
-            </div>
-            <div className="flex items-center gap-1 text-[10px] text-cyan-400/90 font-mono">
-              <IconCpu />
-              {session.totalTokens}
-            </div>
+            </span>
+            <span className="text-slate-700">│</span>
+            <span
+              className="text-orange-400/90"
+              title={`未缓存输入 Token: ${session.totalInputUncachedTokens}`}
+            >
+              未缓 {formatTokenCount(session.totalInputUncachedTokens)}
+            </span>
+            <span
+              className="text-cyan-400/90"
+              title={`缓存输入 Token: ${session.totalInputCachedTokens}`}
+            >
+              缓存 {formatTokenCount(session.totalInputCachedTokens)}
+            </span>
+            <span className="text-slate-700">│</span>
+            <span
+              className="text-indigo-400/90"
+              title={`输出 Token: ${session.totalOutputTokens}`}
+            >
+              输出 {formatTokenCount(session.totalOutputTokens)}
+            </span>
           </div>
         </div>
       </div>
@@ -1861,7 +2135,7 @@ export default function App() {
       {/* ==========================================
           页头 & 汇总统计
          ========================================== */}
-      <header className="flex justify-between items-center glass-panel px-6 py-4 h-20 shrink-0 shimmer-glow border-slate-850 shadow-lg">
+      <header className="flex justify-between items-center glass-panel px-6 py-4 h-20 shrink-0 shimmer-glow border-slate-800 shadow-lg">
         <div className="flex items-center gap-3">
           <div className="w-10 h-10 rounded-xl bg-gradient-to-tr from-cyan-400 via-indigo-500 to-purple-600 flex items-center justify-center font-bold text-xl text-slate-950 shadow-[0_0_20px_rgba(6,182,212,0.4)] transition-transform hover:scale-105">
             LR
@@ -1877,8 +2151,8 @@ export default function App() {
         </div>
 
         {/* 顶部实时概览 */}
-        <div className="hidden lg:flex items-center gap-8 bg-slate-950/35 border border-slate-900 px-6 py-2.5 rounded-2xl">
-          <div className="flex flex-col items-center border-r border-slate-900/60 pr-6">
+        <div className="hidden md:flex items-center gap-4 lg:gap-8 bg-slate-950/35 border border-slate-900 px-3 py-2 lg:px-6 lg:py-2.5 rounded-2xl">
+          <div className="flex flex-col items-center border-r border-slate-900/60 pr-4 lg:pr-6">
             <span className="text-[10px] text-slate-500 font-medium uppercase tracking-wider mb-0.5">
               请求总量
             </span>
@@ -1886,7 +2160,7 @@ export default function App() {
               {stats.totalCalls}
             </span>
           </div>
-          <div className="flex flex-col items-center border-r border-slate-900/60 pr-6">
+          <div className="flex flex-col items-center border-r border-slate-900/60 pr-4 lg:pr-6">
             <span className="text-[10px] text-slate-500 font-medium uppercase tracking-wider mb-0.5">
               成功率
             </span>
@@ -1894,43 +2168,36 @@ export default function App() {
               {(stats.successRate * 100).toFixed(1)}%
             </span>
           </div>
-          <div className="flex flex-col items-center border-r border-slate-900/60 pr-6">
+          <div className="flex flex-col items-center border-r border-slate-900/60 pr-4 lg:pr-6">
             <span className="text-[10px] text-slate-500 font-medium uppercase tracking-wider mb-1">
-              Token 消耗 (总/未缓存)
+              Token 消耗 (总/未缓/缓存/输出)
             </span>
-            <div className="flex items-center gap-2.5 text-xs font-bold font-mono">
-              <div
-                className="flex items-center gap-1 text-purple-400 drop-shadow-[0_0_8px_rgba(139,92,246,0.15)]"
+            <div className="flex items-center gap-2 text-xs font-bold font-mono">
+              <span
+                className="text-purple-400"
                 title={`总吞吐 Token: ${stats.totalTokens}`}
               >
-                <IconCpu />
-                <span className="text-sm">
-                  {stats.totalTokens >= 1000000
-                    ? `${(stats.totalTokens / 1000000).toFixed(2)}M`
-                    : stats.totalTokens >= 1000
-                      ? `${(stats.totalTokens / 1000).toFixed(1)}K`
-                      : stats.totalTokens}
-                </span>
-              </div>
+                {formatTokenCount(stats.totalTokens)}
+              </span>
               <span className="text-slate-700/80">/</span>
-              {(() => {
-                const uncached = stats.totalTokens - stats.totalCachedTokens;
-                return (
-                  <div
-                    className="flex items-center gap-0.5 text-orange-400 drop-shadow-[0_0_8px_rgba(249,115,22,0.15)]"
-                    title={`未缓存计费 Token: ${uncached}`}
-                  >
-                    <IconFlame />
-                    <span className="text-sm">
-                      {uncached >= 1000000
-                        ? `${(uncached / 1000000).toFixed(2)}M`
-                        : uncached >= 1000
-                          ? `${(uncached / 1000).toFixed(1)}K`
-                          : uncached}
-                    </span>
-                  </div>
-                );
-              })()}
+              <span
+                className="text-orange-400"
+                title={`未缓存输入 Token: ${stats.totalInputTokens - stats.totalCachedTokens}`}
+              >
+                {formatTokenCount(stats.totalInputTokens - stats.totalCachedTokens)}
+              </span>
+              <span
+                className="text-cyan-400"
+                title={`缓存输入 Token: ${stats.totalCachedTokens}`}
+              >
+                {formatTokenCount(stats.totalCachedTokens)}
+              </span>
+              <span
+                className="text-indigo-400"
+                title={`输出 Token: ${stats.totalOutputTokens}`}
+              >
+                {formatTokenCount(stats.totalOutputTokens)}
+              </span>
             </div>
           </div>
           <div className="flex flex-col items-center">
@@ -1973,7 +2240,13 @@ export default function App() {
       {/* 视图切换 Tabs */}
       <div className="flex gap-2 shrink-0 px-1">
         <button
-          onClick={() => setViewMode("logs")}
+          onClick={() => {
+            if (viewMode !== "logs") {
+              setSearchInput("");
+              setSearchKeyword("");
+            }
+            setViewMode("logs");
+          }}
           className={`px-6 py-2 rounded-xl text-sm font-semibold transition-all ${
             viewMode === "logs"
               ? "bg-cyan-500 text-slate-950 shadow-[0_0_15px_rgba(6,182,212,0.4)]"
@@ -1983,7 +2256,13 @@ export default function App() {
           请求列表
         </button>
         <button
-          onClick={() => setViewMode("sessions")}
+          onClick={() => {
+            if (viewMode !== "sessions") {
+              setSearchInput("");
+              setSearchKeyword("");
+            }
+            setViewMode("sessions");
+          }}
           className={`px-6 py-2 rounded-xl text-sm font-semibold transition-all ${
             viewMode === "sessions"
               ? "bg-indigo-500 text-slate-950 shadow-[0_0_15px_rgba(99,102,241,0.4)]"
@@ -1999,7 +2278,7 @@ export default function App() {
          ========================================== */}
       <main className="flex flex-1 overflow-hidden gap-5 md:gap-6 min-h-0">
         {/* 左栏：日志卡片列表 */}
-        <section className="w-full md:w-[400px] lg:w-[440px] flex flex-col glass-panel p-5 gap-5 min-h-0 flex-shrink-0 border-slate-850 shadow-lg">
+        <section className="w-full md:w-[400px] lg:w-[440px] flex flex-col glass-panel p-5 gap-5 min-h-0 flex-shrink-0 border-slate-800 shadow-lg">
           {/* 搜索与过滤 */}
           <div className="flex flex-col gap-3 bg-slate-950/20 border border-slate-900/50 p-3.5 rounded-2xl">
             <div className="relative flex items-center">
@@ -2022,7 +2301,7 @@ export default function App() {
                     else setCurrentSessionPage(1);
                   }
                 }}
-                className="w-full pl-10 pr-3.5 py-2.5 bg-slate-950/40 focus:bg-slate-950/85 text-xs border border-slate-850/85 focus:border-cyan-500/60 rounded-xl transition-all outline-none placeholder:text-slate-500 text-slate-200"
+                className="w-full pl-10 pr-3.5 py-2.5 bg-slate-950/40 focus:bg-slate-950/85 text-xs border border-slate-800/85 focus:border-cyan-500/60 rounded-xl transition-all outline-none placeholder:text-slate-500 text-slate-200"
               />
             </div>
 
@@ -2034,7 +2313,7 @@ export default function App() {
                     setProviderFilter(e.target.value);
                     setCurrentPage(1);
                   }}
-                  className="flex-1 bg-slate-950/40 focus:bg-slate-950/85 text-xs border border-slate-850/85 focus:border-cyan-500/60 rounded-xl p-2.5 outline-none transition-all text-slate-300"
+                  className="flex-1 bg-slate-950/40 focus:bg-slate-950/85 text-xs border border-slate-800/85 focus:border-cyan-500/60 rounded-xl p-2.5 outline-none transition-all text-slate-300"
                 >
                   <option value="all">所有厂商</option>
                   <option value="openai">OpenAI</option>
@@ -2048,7 +2327,7 @@ export default function App() {
                     setStatusFilter(e.target.value);
                     setCurrentPage(1);
                   }}
-                  className="flex-1 bg-slate-950/40 focus:bg-slate-950/85 text-xs border border-slate-850/85 focus:border-cyan-500/60 rounded-xl p-2.5 outline-none transition-all text-slate-300"
+                  className="flex-1 bg-slate-950/40 focus:bg-slate-950/85 text-xs border border-slate-800/85 focus:border-cyan-500/60 rounded-xl p-2.5 outline-none transition-all text-slate-300"
                 >
                   <option value="all">所有状态</option>
                   <option value="success">成功 (2xx)</option>
@@ -2061,7 +2340,7 @@ export default function App() {
           {/* 滚动卡片列表 */}
           <div className="flex-1 overflow-y-auto flex flex-col gap-3 pr-1.5 min-h-0 scroll-isolated">
             {viewMode === "logs" ? (
-              isListLoading && logs.length === 0 ? (
+              isLogsLoading && logs.length === 0 ? (
                 <div className="flex flex-col items-center justify-center py-20 text-slate-500 text-xs gap-2">
                   <IconRefresh className="animate-spin text-cyan-400" />
                   <span>加载请求日志中...</span>
@@ -2075,7 +2354,7 @@ export default function App() {
                   {logs.map((log) => renderLogCard(log))}
                 </div>
               )
-            ) : isListLoading && sessions.length === 0 ? (
+            ) : isSessionsLoading && sessions.length === 0 ? (
               <div className="flex flex-col items-center justify-center py-20 text-slate-500 text-xs gap-2">
                 <IconRefresh className="animate-spin text-indigo-400" />
                 <span>加载会话列表中...</span>
@@ -2094,7 +2373,7 @@ export default function App() {
           {/* 分页组件 */}
           {viewMode === "logs"
             ? totalLogs > pageSize && (
-                <div className="flex justify-between items-center pt-2 border-t border-slate-850 text-xs text-slate-400">
+                <div className="flex justify-between items-center pt-2 border-t border-slate-800 text-xs text-slate-400">
                   <span>共 {totalLogs} 条</span>
                   <div className="flex gap-1">
                     <button
@@ -2118,7 +2397,7 @@ export default function App() {
                 </div>
               )
             : totalSessions > sessionPageSize && (
-                <div className="flex justify-between items-center pt-2 border-t border-slate-850 text-xs text-slate-400">
+                <div className="flex justify-between items-center pt-2 border-t border-slate-800 text-xs text-slate-400">
                   <span>共 {totalSessions} 个会话</span>
                   <div className="flex gap-1">
                     <button
@@ -2157,7 +2436,7 @@ export default function App() {
         </section>
 
         {/* 右栏：追踪和调试面板 */}
-        <section className="flex-1 flex flex-col glass-panel p-6 min-h-0 border-slate-850 shadow-lg min-w-0">
+        <section className="flex-1 flex flex-col glass-panel p-6 min-h-0 border-slate-800 shadow-lg min-w-0">
           {!selectedLogId ? (
             <div className="flex-1 flex flex-col items-center justify-center text-slate-500 gap-4">
               <div className="w-12 h-12 rounded-full bg-slate-900/60 border border-slate-800 flex items-center justify-center text-slate-400">
@@ -2169,856 +2448,18 @@ export default function App() {
                   : "请在左侧选择一个会话来浏览完整的上下文历史、Token 统计与详情"}
               </p>
             </div>
-          ) : isLogLoading ? (
-            <div className="flex-1 flex flex-col items-center justify-center text-slate-500 gap-4">
-              <IconRefresh className="animate-spin text-cyan-400 w-8 h-8" />
-              <p className="text-xs font-medium tracking-wide">
-                加载请求结构化详情中...
-              </p>
-            </div>
-          ) : !selectedLog ? (
-            <div className="flex-1 flex flex-col items-center justify-center text-red-400 gap-3">
-              <span>加载日志失败，请稍后重试</span>
-            </div>
           ) : (
-            <div className="flex-1 flex flex-col overflow-hidden gap-6 min-h-0">
-              {/* 详情头部元数据卡片 (Grid 布局，突出核心指标) */}
-              <div className="p-5 bg-slate-950/35 border border-slate-900/60 rounded-2xl flex flex-col gap-4 lg:flex-row lg:justify-between lg:items-center">
-                <div className="flex flex-col gap-2 min-w-0">
-                  <div className="flex flex-wrap items-center gap-2.5">
-                    <span className="text-base font-bold font-mono text-cyan-400 tracking-tight truncate">
-                      {selectedLog.model}
-                    </span>
-                    <span className="text-[10px] px-2 py-0.5 rounded-full bg-slate-900 border border-slate-800 text-slate-400 uppercase font-bold tracking-wider shrink-0">
-                      {selectedLog.provider}
-                    </span>
-                  </div>
-                  <span className="text-[10px] text-slate-500 font-mono truncate">
-                    {selectedLog.sessionId
-                      ? `会话 #${selectedLog.sessionSeq} (ID: ${selectedLog.id})`
-                      : `ID: ${selectedLog.id}`}{" "}
-                    • Path: {selectedLog.path}
-                  </span>
-                </div>
-
-                <div
-                  className={`grid grid-cols-2 ${selectedLog.cachedTokens > 0 || selectedLog.cacheReadTokens > 0 || selectedLog.cacheCreationTokens > 0 ? "sm:grid-cols-5" : "sm:grid-cols-4"} gap-3 text-xs font-mono shrink-0`}
-                >
-                  <div className="flex flex-col items-start lg:items-end px-3.5 py-2 rounded-xl bg-orange-950/15 border border-orange-900/15">
-                    <span className="text-[9px] text-slate-500 font-medium uppercase tracking-wider mb-0.5">
-                      请求耗时
-                    </span>
-                    <span className="font-bold text-sm text-orange-400">
-                      {(selectedLog.durationMs / 1000).toFixed(2)}s
-                    </span>
-                  </div>
-                  <div className="flex flex-col items-start lg:items-end px-3.5 py-2 rounded-xl bg-cyan-950/15 border border-cyan-900/15">
-                    <span className="text-[9px] text-slate-500 font-medium uppercase tracking-wider mb-0.5">
-                      输入 Tokens
-                    </span>
-                    <span className="font-bold text-sm text-cyan-400">
-                      {selectedLog.inputTokens}
-                    </span>
-                    {selectedLog.cachedTokens > 0 && (
-                      <span className="text-[8px] text-slate-450 mt-0.5">
-                        实际计算:{" "}
-                        {selectedLog.inputTokens - selectedLog.cachedTokens}
-                      </span>
-                    )}
-                  </div>
-                  {(selectedLog.cachedTokens > 0 ||
-                    selectedLog.cacheReadTokens > 0 ||
-                    selectedLog.cacheCreationTokens > 0) && (
-                    <div className="flex flex-col items-start lg:items-end px-3.5 py-2 rounded-xl bg-indigo-950/20 border border-indigo-900/30 text-indigo-400">
-                      <span className="text-[9px] text-slate-500 font-medium uppercase tracking-wider mb-0.5">
-                        缓存 Tokens
-                      </span>
-                      <span className="font-bold text-sm text-indigo-400">
-                        {selectedLog.cachedTokens}
-                      </span>
-                      <span className="text-[8px] text-slate-450 mt-0.5 truncate max-w-full">
-                        {selectedLog.provider === "openai" ||
-                        selectedLog.provider === "openai-responses"
-                          ? "命中缓存"
-                          : `读缓存 (另写 ${selectedLog.cacheCreationTokens})`}
-                      </span>
-                    </div>
-                  )}
-                  <div className="flex flex-col items-start lg:items-end px-3.5 py-2 rounded-xl bg-purple-950/15 border border-purple-900/15">
-                    <span className="text-[9px] text-slate-500 font-medium uppercase tracking-wider mb-0.5">
-                      输出 Tokens
-                    </span>
-                    <span className="font-bold text-sm text-purple-400">
-                      {selectedLog.outputTokens}
-                    </span>
-                  </div>
-                  <div
-                    className={`flex flex-col items-start lg:items-end px-3.5 py-2 rounded-xl border ${
-                      selectedLog.statusCode >= 200 &&
-                      selectedLog.statusCode < 300
-                        ? "bg-emerald-950/15 border-emerald-900/15 text-emerald-400"
-                        : "bg-red-950/15 border-red-900/15 text-red-400"
-                    }`}
-                  >
-                    <span className="text-[9px] text-slate-500 font-medium uppercase tracking-wider mb-0.5">
-                      状态代码
-                    </span>
-                    <span className="font-bold text-sm">
-                      {selectedLog.statusCode}
-                    </span>
-                  </div>
-                </div>
-              </div>
-
-              {/* 时序控制 Tab */}
-              <div className="flex border-b border-slate-900 pb-1 gap-6 shrink-0">
-                <button
-                  onClick={() => setActiveTab("trace")}
-                  className={`pb-2.5 text-xs font-bold border-b-2 transition-all ${
-                    activeTab === "trace"
-                      ? "border-cyan-400 text-cyan-400 drop-shadow-[0_0_8px_rgba(6,182,212,0.3)]"
-                      : "border-transparent text-slate-400 hover:text-slate-200"
-                  }`}
-                >
-                  时序追踪 (Trace)
-                </button>
-                <button
-                  onClick={() => setActiveTab("prompt")}
-                  className={`pb-2.5 text-xs font-bold border-b-2 transition-all ${
-                    activeTab === "prompt"
-                      ? "border-cyan-400 text-cyan-400 drop-shadow-[0_0_8px_rgba(6,182,212,0.3)]"
-                      : "border-transparent text-slate-400 hover:text-slate-200"
-                  }`}
-                >
-                  请求消息 (
-                  {selectedLog.prompt
-                    ? selectedLog.prompt.filter((p) => p.role !== "system")
-                        .length
-                    : 0}
-                  )
-                </button>
-                {selectedLog.sessionId && (
-                  <button
-                    onClick={() => setActiveTab("session")}
-                    className={`pb-2.5 text-xs font-bold border-b-2 transition-all ${
-                      activeTab === "session"
-                        ? "border-cyan-400 text-cyan-400 drop-shadow-[0_0_8px_rgba(6,182,212,0.3)]"
-                        : "border-transparent text-slate-400 hover:text-slate-200"
-                    }`}
-                  >
-                    会话历史 (Session)
-                    {totalSessionTokens > 0 ? ` • ${totalSessionTokens} T` : ""}
-                  </button>
-                )}
-                {selectedLog.tools && selectedLog.tools.length > 0 && (
-                  <button
-                    onClick={() => setActiveTab("tools")}
-                    className={`pb-2.5 text-xs font-bold border-b-2 transition-all ${
-                      activeTab === "tools"
-                        ? "border-cyan-400 text-cyan-400 drop-shadow-[0_0_8px_rgba(6,182,212,0.3)]"
-                        : "border-transparent text-slate-400 hover:text-slate-200"
-                    }`}
-                  >
-                    定义的工具 ({selectedLog.tools.length})
-                  </button>
-                )}
-                <button
-                  onClick={() => setActiveTab("raw_req")}
-                  className={`pb-2.5 text-xs font-bold border-b-2 transition-all ${
-                    activeTab === "raw_req"
-                      ? "border-cyan-400 text-cyan-400 drop-shadow-[0_0_8px_rgba(6,182,212,0.3)]"
-                      : "border-transparent text-slate-400 hover:text-slate-200"
-                  }`}
-                >
-                  原始请求 JSON
-                </button>
-                <button
-                  onClick={() => setActiveTab("raw_resp")}
-                  className={`pb-2.5 text-xs font-bold border-b-2 transition-all ${
-                    activeTab === "raw_resp"
-                      ? "border-cyan-400 text-cyan-400 drop-shadow-[0_0_8px_rgba(6,182,212,0.3)]"
-                      : "border-transparent text-slate-400 hover:text-slate-200"
-                  }`}
-                >
-                  原始响应 Raw
-                </button>
-              </div>
-
-              {/* Tab 内容区 */}
-              <div className="flex-1 overflow-y-auto pr-1.5 min-h-0 flex flex-col gap-4 scroll-isolated">
-                {/* 1. 时序追踪 (Trace) */}
-                {activeTab === "trace" && (
-                  <div className="flex flex-col gap-5">
-                    {/* 可视化分段 Timeline */}
-                    <div className="p-4 bg-slate-950/20 border border-slate-900 rounded-xl flex flex-col gap-3">
-                      <div className="flex justify-between items-center text-xs text-slate-400 font-mono">
-                        <span className="font-semibold text-slate-300">
-                          时序可视化时间线
-                        </span>
-                        <span className="text-cyan-400 font-bold">
-                          {(selectedLog.durationMs / 1000).toFixed(2)}s
-                        </span>
-                      </div>
-
-                      {/* 分段时间条 (两段式网络连接与传输模型响应) */}
-                      <div className="h-7 w-full bg-slate-950/80 rounded-lg overflow-hidden flex relative p-0.5 border border-slate-900">
-                        {/* 150ms 假定的连接建立 */}
-                        <div
-                          className="h-full bg-indigo-600/40 rounded-l-md border-r border-slate-900/30 flex items-center justify-center text-[8px] font-bold text-indigo-300 shrink-0"
-                          style={{
-                            width: `${Math.min(15, Math.max(5, (150 / selectedLog.durationMs) * 100))}%`,
-                          }}
-                        >
-                          连接
-                        </div>
-                        {/* 剩余的大部分为响应传输段 */}
-                        <div
-                          className="h-full timeline-shimmer rounded-r-md"
-                          style={{ flex: 1 }}
-                        />
-                        <div className="absolute inset-0 flex justify-end items-center pr-4 text-[9px] font-bold text-white uppercase tracking-wider drop-shadow-md">
-                          <span>
-                            传输流 •{" "}
-                            {(selectedLog.durationMs / 1000).toFixed(2)}s
-                          </span>
-                        </div>
-                      </div>
-
-                      {/* 如果有工具调用，显示时序序列图 */}
-                      {selectedLog.response &&
-                        selectedLog.response.tool_calls &&
-                        selectedLog.response.tool_calls.length > 0 && (
-                          <div className="mt-1.5 flex flex-col gap-2.5">
-                            <span className="text-[10px] text-slate-500 uppercase font-bold tracking-wider">
-                              执行的 Tool Call Spans
-                            </span>
-                            <div className="flex flex-col gap-2">
-                              {selectedLog.response.tool_calls.map(
-                                (tc, idx) => (
-                                  <div
-                                    key={idx}
-                                    className="flex items-center justify-between px-3 py-2.5 bg-slate-950/40 border border-slate-900 rounded-xl text-xs"
-                                  >
-                                    <div className="flex items-center gap-2 min-w-0">
-                                      <span className="text-[9px] font-bold px-2 py-0.5 bg-orange-950/80 border border-orange-900/20 text-orange-400 rounded-md shrink-0">
-                                        TOOL
-                                      </span>
-                                      <span className="font-mono text-slate-200 font-semibold truncate">
-                                        {tc.name}
-                                      </span>
-                                    </div>
-                                    <span className="text-[9px] text-slate-500 font-mono shrink-0">
-                                      id: {tc.id}
-                                    </span>
-                                  </div>
-                                ),
-                              )}
-                            </div>
-                          </div>
-                        )}
-                    </div>
-                  </div>
-                )}
-
-                {/* 2. 对话结构化展示 */}
-                {activeTab === "prompt" && (
-                  <div className="flex flex-col gap-4">
-                    {/* 折叠 System Prompt 或定义工具 */}
-                    <div className="flex flex-col gap-2.5">
-                      <button
-                        onClick={() => setShowSystemPrompt(!showSystemPrompt)}
-                        className="flex justify-between items-center px-4 py-3 bg-slate-950/40 hover:bg-slate-900/60 border border-slate-900/85 rounded-xl text-xs text-slate-300 transition-all active:scale-[0.99]"
-                      >
-                        <span className="flex items-center gap-2">
-                          <IconTerminal />
-                          <span className="font-semibold">System 提示词</span>
-                        </span>
-                        <span className="text-slate-450">
-                          {showSystemPrompt ? (
-                            <IconChevronDown />
-                          ) : (
-                            <IconChevronRight />
-                          )}
-                        </span>
-                      </button>
-                      {showSystemPrompt && (
-                        <div className="p-4 bg-slate-950/60 border border-slate-900 rounded-xl text-xs font-mono text-slate-400 whitespace-pre-wrap leading-relaxed">
-                          {selectedLog.prompt &&
-                          selectedLog.prompt.filter((p) => p.role === "system")
-                            .length > 0
-                            ? selectedLog.prompt
-                                .filter((p) => p.role === "system")
-                                .map((p) => p.content)
-                                .join("\n")
-                            : "无系统提示词"}
-                        </div>
-                      )}
-                    </div>
-
-                    {/* 消息时间线 */}
-                    <div className="flex flex-col gap-4">
-                      <h3 className="text-xs uppercase font-bold tracking-wider text-slate-400">
-                        消息流记录
-                      </h3>
-                      {selectedLog.prompt &&
-                        selectedLog.prompt
-                          .filter((p) => p.role !== "system")
-                          .map((m, idx) => {
-                            const isUser = m.role === "user";
-                            const isTool = m.role === "tool";
-                            const isAssistant = m.role === "assistant";
-
-                            return (
-                              <div
-                                key={idx}
-                                className={`p-5 rounded-2xl border flex flex-col gap-3.5 shadow-sm ${
-                                  isUser
-                                    ? "bg-cyan-950/10 border-cyan-950/40"
-                                    : isTool
-                                      ? "bg-orange-950/10 border-orange-950/40"
-                                      : "bg-slate-950/25 border-slate-900"
-                                }`}
-                              >
-                                <div className="flex justify-between items-center">
-                                  <span
-                                    className={`text-[10px] font-bold uppercase tracking-wider px-2.5 py-1 rounded-md border ${
-                                      isUser
-                                        ? "bg-cyan-950/60 border-cyan-900/30 text-cyan-400"
-                                        : isTool
-                                          ? "bg-orange-950/60 border-orange-900/30 text-orange-400"
-                                          : "bg-slate-900/60 border-slate-800/80 text-cyan-400"
-                                    }`}
-                                  >
-                                    {isUser
-                                      ? "👤 User"
-                                      : isTool
-                                        ? "🛠️ Tool Response"
-                                        : "🤖 Assistant"}
-                                    {m.name && (
-                                      <span className="text-slate-400 font-mono text-[9px] ml-1">
-                                        ({m.name})
-                                      </span>
-                                    )}
-                                  </span>
-                                  {m.tool_call_id && (
-                                    <span className="text-[9px] text-slate-500 font-mono">
-                                      ID: {m.tool_call_id}
-                                    </span>
-                                  )}
-                                </div>
-
-                                {/* 如果有思维链，进行展示 */}
-                                {isAssistant && m.thinking && (
-                                  <div className="p-3.5 bg-slate-900/40 border border-slate-850/60 rounded-xl text-xs text-slate-450/90 italic whitespace-pre-wrap border-l-2 border-l-purple-500/60">
-                                    <div className="text-[9px] font-bold text-purple-400 uppercase tracking-wider not-italic mb-1">
-                                      思考过程 (Thinking)
-                                    </div>
-                                    {m.thinking}
-                                  </div>
-                                )}
-
-                                {m.content && (
-                                  <div className="text-sm leading-relaxed tracking-wide text-slate-200 whitespace-pre-wrap mt-0.5">
-                                    {m.content}
-                                  </div>
-                                )}
-
-                                {/* 工具调用展示 */}
-                                {isAssistant &&
-                                  m.tool_calls &&
-                                  m.tool_calls.length > 0 && (
-                                    <div className="mt-1 flex flex-col gap-2 font-mono">
-                                      <div className="text-[9px] font-bold text-orange-400 uppercase tracking-wider">
-                                        触发工具调用 (Tool Calls)
-                                      </div>
-                                      {m.tool_calls.map((tc, tcIdx) => (
-                                        <div
-                                          key={tcIdx}
-                                          className="p-3 bg-slate-950/40 border border-slate-900 rounded-xl text-xs text-slate-300"
-                                        >
-                                          <div>
-                                            <span className="text-slate-500">
-                                              Method:
-                                            </span>{" "}
-                                            <span className="text-orange-400 font-semibold">
-                                              {tc.name}
-                                            </span>
-                                          </div>
-                                          <div className="mt-1">
-                                            <span className="text-slate-500">
-                                              Args:
-                                            </span>{" "}
-                                            <span className="text-emerald-400/90">
-                                              {tc.arguments}
-                                            </span>
-                                          </div>
-                                          {renderSubLogsForTool(tc.id)}
-                                        </div>
-                                      ))}
-                                    </div>
-                                  )}
-                              </div>
-                            );
-                          })}
-
-                      {/* 渲染当次最新大模型回复 */}
-                      {selectedLog.response &&
-                        (selectedLog.response.content ||
-                          selectedLog.response.thinking ||
-                          (selectedLog.response.tool_calls &&
-                            selectedLog.response.tool_calls.length > 0)) && (
-                          <div className="p-5 rounded-2xl border flex flex-col gap-3.5 shadow-sm bg-slate-950/25 border-slate-900 border-l-[3px] border-l-cyan-500/50">
-                            <div className="flex justify-between items-center">
-                              <span className="text-[10px] font-bold uppercase tracking-wider px-2.5 py-1 rounded-md border bg-slate-900/60 border-slate-800/80 text-cyan-400">
-                                🤖 Assistant (最新回复)
-                              </span>
-                            </div>
-
-                            {/* 如果有思维链，进行展示 */}
-                            {selectedLog.response.thinking && (
-                              <div className="p-3.5 bg-slate-900/40 border border-slate-850/60 rounded-xl text-xs text-slate-450/90 italic whitespace-pre-wrap border-l-2 border-l-purple-500/60">
-                                <div className="text-[9px] font-bold text-purple-400 uppercase tracking-wider not-italic mb-1">
-                                  思考过程 (Thinking)
-                                </div>
-                                {selectedLog.response.thinking}
-                              </div>
-                            )}
-
-                            {/* 消息正文 */}
-                            {selectedLog.response.content && (
-                              <div className="text-sm leading-relaxed tracking-wide text-slate-200 whitespace-pre-wrap mt-0.5">
-                                {selectedLog.response.content}
-                              </div>
-                            )}
-
-                            {/* 工具调用展示 */}
-                            {selectedLog.response.tool_calls &&
-                              selectedLog.response.tool_calls.length > 0 && (
-                                <div className="mt-1 flex flex-col gap-2 font-mono">
-                                  <div className="text-[9px] font-bold text-orange-400 uppercase tracking-wider">
-                                    触发工具调用 (Tool Calls)
-                                  </div>
-                                  {selectedLog.response.tool_calls.map(
-                                    (tc, tcIdx) => (
-                                      <div
-                                        key={tcIdx}
-                                        className="p-3 bg-slate-950/40 border border-slate-900 rounded-xl text-xs text-slate-300"
-                                      >
-                                        <div>
-                                          <span className="text-slate-500">
-                                            Method:
-                                          </span>{" "}
-                                          <span className="text-orange-400 font-semibold">
-                                            {tc.name}
-                                          </span>
-                                        </div>
-                                        <div className="mt-1">
-                                          <span className="text-slate-500">
-                                            Args:
-                                          </span>{" "}
-                                          <span className="text-emerald-400/90">
-                                            {tc.arguments}
-                                          </span>
-                                        </div>
-                                        {renderSubLogsForTool(tc.id)}
-                                      </div>
-                                    ),
-                                  )}
-                                </div>
-                              )}
-                          </div>
-                        )}
-                    </div>
-                  </div>
-                )}
-
-                {/* 会话历史 (Session Trace) */}
-                {activeTab === "session" && selectedLog.sessionId && (
-                  <div className="flex flex-col gap-5 select-none font-sans">
-                    <div className="text-[10px] text-slate-400 font-bold uppercase tracking-wider mb-1 flex justify-between items-center bg-slate-950/20 px-4 py-2 border border-slate-900/50 rounded-xl">
-                      <div className="flex items-center gap-2">
-                        <span>🔗 会话轮次目录 / 点击可快速定位详情</span>
-                        <span className="font-mono text-cyan-400">
-                          ({sessionLogs.length} 轮对话 • 未缓存输入{" "}
-                          {totalSessionUncachedInputTokens} / 缓存{" "}
-                          {totalSessionCachedTokens} / 输出{" "}
-                          {totalSessionOutputTokens} / 共 {totalSessionTokens}{" "}
-                          Tokens)
-                        </span>
-                      </div>
-                      <button
-                        onClick={() =>
-                          handleDeleteSessionLogs(selectedLog.sessionId)
-                        }
-                        className="flex items-center gap-1 text-[10px] font-bold text-red-400 hover:text-red-300 px-2.5 py-1 rounded-lg bg-red-950/20 hover:bg-red-950/40 border border-red-900/30 transition-all active:scale-95 cursor-pointer"
-                        title="删除该会话所有请求日志"
-                      >
-                        <IconTrash />
-                        <span>删除会话所有请求</span>
-                      </button>
-                    </div>
-
-                    {isSessionLoading ? (
-                      <div className="flex flex-col items-center justify-center py-20 text-slate-500 text-xs gap-2">
-                        <IconRefresh className="animate-spin text-cyan-400" />
-                        <span>加载会话目录中...</span>
-                      </div>
-                    ) : sessionLogs.length === 0 ? (
-                      <div className="text-center py-20 text-slate-500 text-xs">
-                        该会话暂无历史记录
-                      </div>
-                    ) : (
-                      <div className="flex flex-col gap-3 relative pl-4 border-l border-slate-800/60 ml-3">
-                        {sessionLogs.map((sLog, idx) => {
-                          const isCurrent = sLog.id === selectedLog.id;
-                          const isSuccess =
-                            sLog.statusCode >= 200 && sLog.statusCode < 300;
-
-                          // 提取输入消息 (逆序查找最新 user 消息或 tool 消息)
-                          let inputMsg = null;
-                          if (sLog.prompt && sLog.prompt.length > 0) {
-                            for (let i = sLog.prompt.length - 1; i >= 0; i--) {
-                              const m = sLog.prompt[i];
-                              if (m.role === "user" || m.role === "tool") {
-                                inputMsg = m;
-                                break;
-                              }
-                            }
-                          }
-
-                          let inputText = "";
-                          let inputRoleLabel = "";
-                          let inputRoleBadgeColor = "";
-                          if (inputMsg) {
-                            if (inputMsg.role === "user") {
-                              inputRoleLabel = "👤 User";
-                              inputRoleBadgeColor =
-                                "text-cyan-400 bg-cyan-950/30 border-cyan-900/30";
-                              inputText = simplifyUserPrompt(
-                                inputMsg.content || "",
-                              );
-                            } else {
-                              inputRoleLabel = `🛠️ Tool (${inputMsg.name || "unknown"})`;
-                              inputRoleBadgeColor =
-                                "text-orange-400 bg-orange-950/30 border-orange-900/30";
-                              inputText = inputMsg.content || "";
-                            }
-                          } else {
-                            inputRoleLabel = "💬 Info";
-                            inputRoleBadgeColor =
-                              "text-slate-400 bg-slate-900/40 border-slate-800/40";
-                            inputText = sLog.sessionSummary || "";
-                          }
-
-                          const shortInput =
-                            inputText && inputText.trim() !== ""
-                              ? inputText.length > 95
-                                ? inputText.substring(0, 95) + "..."
-                                : inputText
-                              : "无详细输入";
-
-                          // 提取输出消息
-                          let outputText = "";
-                          let outputLabel = "";
-                          let outputBadgeColor = "";
-                          if (!isSuccess) {
-                            outputLabel = "❌ Error";
-                            outputBadgeColor =
-                              "text-red-400 bg-red-950/30 border-red-900/30";
-                            outputText =
-                              sLog.errorMessage ||
-                              `HTTP Status ${sLog.statusCode}`;
-                          } else if (sLog.response) {
-                            const resp = sLog.response;
-                            const hasToolCalls =
-                              resp.tool_calls && resp.tool_calls.length > 0;
-                            const hasContent =
-                              resp.content && resp.content.trim() !== "";
-                            const hasThinking =
-                              resp.thinking && resp.thinking.trim() !== "";
-
-                            if (hasToolCalls) {
-                              outputLabel = "🔧 Tool Call";
-                              outputBadgeColor =
-                                "text-yellow-400 bg-yellow-950/30 border-yellow-900/30";
-                              const toolNames = resp.tool_calls
-                                .map((tc) => tc.name)
-                                .join(", ");
-                              outputText = `调用工具: [${toolNames}]`;
-                            } else if (hasContent) {
-                              outputLabel = "🤖 Assistant";
-                              outputBadgeColor =
-                                "text-emerald-400 bg-emerald-950/30 border-emerald-900/30";
-                              outputText = resp.content.trim();
-                            } else if (hasThinking) {
-                              outputLabel = "💭 Thinking";
-                              outputBadgeColor =
-                                "text-purple-400 bg-purple-950/30 border-purple-900/30";
-                              outputText = resp.thinking.trim();
-                            } else {
-                              outputLabel = "🤖 Assistant";
-                              outputBadgeColor =
-                                "text-slate-450 bg-slate-900/30 border-slate-800/30";
-                              outputText = "无输出内容";
-                            }
-                          } else {
-                            outputLabel = "🤖 Assistant";
-                            outputBadgeColor =
-                              "text-slate-455 bg-slate-900/30 border-slate-800/30";
-                            outputText = "无输出内容";
-                          }
-
-                          const shortOutput =
-                            outputText && outputText.trim() !== ""
-                              ? outputText.length > 95
-                                ? outputText.substring(0, 95) + "..."
-                                : outputText
-                              : "无详细输出";
-
-                          return (
-                            <div
-                              key={sLog.id}
-                              onClick={() => setModalLogId(sLog.id)}
-                              className={`p-3.5 rounded-xl border cursor-pointer relative transition-all flex flex-col gap-2 ${
-                                isCurrent
-                                  ? "bg-slate-900/70 border-cyan-500/60 shadow-[0_0_12px_rgba(6,182,212,0.15)] translate-x-0.5"
-                                  : "bg-slate-950/25 border-slate-900/80 hover:bg-slate-900/40 hover:border-slate-800/80"
-                              }`}
-                            >
-                              {/* 挂件：步骤条时间线小点/圆环 */}
-                              <div
-                                className={`absolute -left-[22px] top-6 w-2.5 h-2.5 rounded-full border-2 transition-all ${
-                                  isCurrent
-                                    ? "bg-cyan-400 border-slate-950 scale-110"
-                                    : "bg-slate-800 border-slate-950 hover:bg-slate-700"
-                                }`}
-                              />
-
-                              {/* 行一：轮次标题与模型 */}
-                              <div className="flex justify-between items-center">
-                                <div className="flex items-center gap-2">
-                                  <span
-                                    className={`text-[10px] font-mono font-bold px-2 py-0.5 rounded transition-all ${
-                                      isCurrent
-                                        ? "bg-cyan-950 text-cyan-400"
-                                        : "bg-slate-900 text-slate-450"
-                                    }`}
-                                  >
-                                    Turn #{sLog.sessionSeq || idx + 1}
-                                  </span>
-                                  <span className="text-[9px] font-mono text-slate-500 truncate max-w-[120px] md:max-w-[180px]">
-                                    {sLog.model}
-                                  </span>
-                                </div>
-                                <div className="flex items-center gap-2.5 text-[9px] font-mono text-slate-450">
-                                  <span>
-                                    {sLog.createdAt
-                                      ? sLog.createdAt.split(" ")[1]
-                                      : ""}
-                                  </span>
-                                  <span>
-                                    {(sLog.durationMs / 1000).toFixed(2)}s
-                                  </span>
-                                  {sLog.totalTokens > 0 && (
-                                    <>
-                                      <span>•</span>
-                                      <span>
-                                        {sLog.totalTokens} tkn
-                                        {sLog.cachedTokens > 0 &&
-                                          ` (未缓存 ${sLog.inputTokens - sLog.cachedTokens})`}
-                                      </span>
-                                    </>
-                                  )}
-                                  <span
-                                    className={`font-bold px-1 py-0.2 rounded ${isSuccess ? "text-emerald-400 bg-emerald-950/20" : "text-red-400 bg-red-950/20"}`}
-                                  >
-                                    {sLog.statusCode}
-                                  </span>
-                                </div>
-                              </div>
-
-                              {/* 行二：精准展示的输入输出流程图 (IN/OUT 极具 Premium 感) */}
-                              <div className="flex flex-col gap-2 mt-1 select-text">
-                                {/* 输入段 */}
-                                <div className="flex items-start gap-2 text-[11px] leading-relaxed">
-                                  <span
-                                    className={`shrink-0 text-[8px] font-bold px-1.5 py-0.5 rounded border ${inputRoleBadgeColor} font-mono w-[60px] text-center`}
-                                  >
-                                    IN
-                                  </span>
-                                  <div className="flex-1 text-slate-300 min-w-0 truncate">
-                                    <span className="text-slate-455 font-semibold mr-1">
-                                      {inputRoleLabel}:
-                                    </span>
-                                    <span
-                                      className={
-                                        isCurrent
-                                          ? "text-slate-100 font-medium"
-                                          : "text-slate-350 hover:text-slate-200"
-                                      }
-                                    >
-                                      {shortInput}
-                                    </span>
-                                  </div>
-                                </div>
-
-                                {/* 指示箭头 */}
-                                <div className="pl-[23px] text-slate-650 flex items-center -my-1">
-                                  <span className="text-[9px] text-slate-600">
-                                    ↓
-                                  </span>
-                                </div>
-
-                                {/* 输出段 */}
-                                <div className="flex items-start gap-2 text-[11px] leading-relaxed">
-                                  <span
-                                    className={`shrink-0 text-[8px] font-bold px-1.5 py-0.5 rounded border ${outputBadgeColor} font-mono w-[60px] text-center`}
-                                  >
-                                    OUT
-                                  </span>
-                                  <div className="flex-1 text-slate-300 min-w-0 truncate">
-                                    <span className="text-slate-455 font-semibold mr-1">
-                                      {outputLabel}:
-                                    </span>
-                                    <span
-                                      className={
-                                        isCurrent
-                                          ? "text-slate-100 font-medium"
-                                          : "text-slate-350 hover:text-slate-200"
-                                      }
-                                    >
-                                      {shortOutput}
-                                    </span>
-                                  </div>
-                                </div>
-                              </div>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    )}
-                  </div>
-                )}
-
-                {/* 3. 原始请求 Raw */}
-                {activeTab === "raw_req" && (
-                  <CodeBlock
-                    code={formatJSON(selectedLog.rawRequest)}
-                    language="Raw HTTP Request Body"
-                  />
-                )}
-
-                {/* 4. 原始响应 Raw */}
-                {activeTab === "raw_resp" && (
-                  <CodeBlock
-                    code={formatJSON(selectedLog.rawResponse)}
-                    language="Raw Upstream Response"
-                  />
-                )}
-
-                {/* 5. 已定义工具 (Tools) */}
-                {activeTab === "tools" &&
-                  selectedLog.tools &&
-                  selectedLog.tools.length > 0 && (
-                    <div className="flex flex-col lg:flex-row gap-5 flex-1 min-h-0 h-full overflow-hidden">
-                      {/* 左侧：工具搜索与列表 */}
-                      <div className="w-full lg:w-[240px] flex flex-col gap-3 shrink-0 bg-slate-950/20 border border-slate-900/40 p-3.5 rounded-2xl min-h-0 overflow-y-auto">
-                        <div className="relative flex items-center">
-                          <span className="absolute left-3.5 text-slate-500">
-                            <IconSearch />
-                          </span>
-                          <input
-                            type="text"
-                            placeholder="搜索工具名..."
-                            value={toolSearchQuery}
-                            onChange={(e) => {
-                              setToolSearchQuery(e.target.value);
-                              setSelectedToolIndex(0);
-                            }}
-                            className="w-full pl-9 pr-3.5 py-1.5 bg-slate-950/40 focus:bg-slate-950/85 text-[11px] border border-slate-850/85 focus:border-cyan-500/60 rounded-lg outline-none placeholder:text-slate-500 text-slate-200"
-                          />
-                        </div>
-
-                        {/* 工具列表 */}
-                        <div className="flex flex-col gap-1.5 overflow-y-auto flex-1 pr-1 font-mono text-[11px]">
-                          {selectedLog.tools
-                            .map((tool, index) => ({ tool, index }))
-                            .filter(({ tool }) =>
-                              tool.name
-                                .toLowerCase()
-                                .includes(toolSearchQuery.toLowerCase()),
-                            )
-                            .map(({ tool, index }) => {
-                              const isSelected = selectedToolIndex === index;
-                              return (
-                                <button
-                                  key={index}
-                                  onClick={() => setSelectedToolIndex(index)}
-                                  className={`text-left px-3 py-2 rounded-lg transition-all truncate border shrink-0 ${
-                                    isSelected
-                                      ? "bg-cyan-950/25 border-cyan-500/50 text-cyan-400 font-bold"
-                                      : "bg-transparent border-transparent text-slate-400 hover:text-slate-200 hover:bg-slate-900/30"
-                                  }`}
-                                  title={tool.name}
-                                >
-                                  🔧 {tool.name}
-                                </button>
-                              );
-                            })}
-                          {selectedLog.tools.filter((t) =>
-                            t.name
-                              .toLowerCase()
-                              .includes(toolSearchQuery.toLowerCase()),
-                          ).length === 0 && (
-                            <div className="text-center text-slate-500 py-6 text-[10px]">
-                              未找到相关工具
-                            </div>
-                          )}
-                        </div>
-                      </div>
-
-                      {/* 右侧：被选中工具的 Schema 和详情 */}
-                      {(() => {
-                        const selectedTool =
-                          selectedLog.tools[selectedToolIndex] ||
-                          selectedLog.tools[0];
-                        if (!selectedTool) return null;
-                        return (
-                          <div className="flex-1 flex flex-col gap-3 min-w-0 overflow-y-auto">
-                            <div className="p-4 bg-slate-950/20 border border-slate-900 rounded-xl flex flex-col gap-2.5">
-                              <div className="flex items-center gap-2">
-                                <span className="text-[10px] font-bold px-2 py-0.5 bg-cyan-950/80 border border-cyan-900/20 text-cyan-400 rounded-md">
-                                  TOOL
-                                </span>
-                                <span className="text-sm font-bold text-slate-200 font-mono">
-                                  {selectedTool.name}
-                                </span>
-                              </div>
-                              {selectedTool.description && (
-                                <p className="text-xs text-slate-400 leading-relaxed bg-slate-950/45 p-3 rounded-lg border border-slate-900/60">
-                                  <span className="font-semibold text-slate-350 block mb-1">
-                                    功能描述：
-                                  </span>
-                                  {selectedTool.description}
-                                </p>
-                              )}
-                            </div>
-                            <div className="flex flex-col shrink-0">
-                              <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider block mb-1">
-                                Parameters Schema
-                              </span>
-                              <CodeBlock
-                                code={formatJSON(selectedTool.parameters)}
-                                language="parameters.schema.json"
-                              />
-                            </div>
-                          </div>
-                        );
-                      })()}
-                    </div>
-                  )}
-              </div>
-            </div>
+            <LogDetail
+              log={selectedLog}
+              isLoading={isLogLoading}
+              defaultTab={inlineDefaultTab}
+              sessionContext={{
+                logs: sessionLogs,
+                isLoading: isSessionLoading,
+                onDelete: handleDeleteSessionLogs,
+              }}
+              onOpenSubLog={setModalLogId}
+            />
           )}
         </section>
       </main>
@@ -3041,7 +2482,7 @@ export default function App() {
               </h2>
               <button
                 onClick={() => setIsSystemLogsOpen(false)}
-                className="text-slate-450 hover:text-slate-200 text-2xl font-light transition-colors active:scale-95 leading-none"
+                className="text-slate-400 hover:text-slate-200 text-2xl font-light transition-colors active:scale-95 leading-none"
               >
                 &times;
               </button>
@@ -3084,7 +2525,7 @@ export default function App() {
             {/* 终端日志展示区 */}
             <div
               ref={logsContainerRef}
-              className="flex-1 p-5 overflow-y-auto bg-black/85 code-font text-xs text-slate-350 leading-relaxed scroll-isolated whitespace-pre-wrap select-text"
+              className="flex-1 p-5 overflow-y-auto bg-black/85 code-font text-xs text-slate-400 leading-relaxed scroll-isolated whitespace-pre-wrap select-text"
             >
               {systemLogs ? (
                 systemLogs
@@ -3121,7 +2562,7 @@ export default function App() {
               </h2>
               <button
                 onClick={() => setIsSettingsOpen(false)}
-                className="text-slate-450 hover:text-slate-200 text-2xl font-light transition-colors active:scale-95 leading-none"
+                className="text-slate-400 hover:text-slate-200 text-2xl font-light transition-colors active:scale-95 leading-none"
               >
                 &times;
               </button>
@@ -3164,7 +2605,7 @@ export default function App() {
                     OpenAI Upstream 路由
                   </span>
                   <div className="flex flex-col gap-1.5">
-                    <label className="text-[10px] text-slate-550 font-bold">
+                    <label className="text-[10px] text-slate-500 font-bold">
                       上游 Base URL
                     </label>
                     <input
@@ -3178,7 +2619,7 @@ export default function App() {
                     />
                   </div>
                   <div className="flex flex-col gap-1.5">
-                    <label className="text-[10px] text-slate-550 font-bold">
+                    <label className="text-[10px] text-slate-500 font-bold">
                       API Key
                     </label>
                     <div className="relative flex items-center">
@@ -3263,7 +2704,7 @@ export default function App() {
                     配置。
                   </p>
                   <div className="flex flex-col gap-1.5">
-                    <label className="text-[10px] text-slate-550 font-bold">
+                    <label className="text-[10px] text-slate-500 font-bold">
                       上游 Base URL
                     </label>
                     <input
@@ -3280,7 +2721,7 @@ export default function App() {
                     />
                   </div>
                   <div className="flex flex-col gap-1.5">
-                    <label className="text-[10px] text-slate-550 font-bold">
+                    <label className="text-[10px] text-slate-500 font-bold">
                       API Key
                     </label>
                     <div className="relative flex items-center">
@@ -3312,7 +2753,7 @@ export default function App() {
                     Anthropic Upstream 路由
                   </span>
                   <div className="flex flex-col gap-1.5">
-                    <label className="text-[10px] text-slate-550 font-bold">
+                    <label className="text-[10px] text-slate-500 font-bold">
                       上游 Base URL
                     </label>
                     <input
@@ -3329,7 +2770,7 @@ export default function App() {
                     />
                   </div>
                   <div className="flex flex-col gap-1.5">
-                    <label className="text-[10px] text-slate-550 font-bold">
+                    <label className="text-[10px] text-slate-500 font-bold">
                       API Key
                     </label>
                     <div className="relative flex items-center">
@@ -3356,7 +2797,7 @@ export default function App() {
                   </div>
                   <div className="rounded-xl border border-slate-900/70 bg-slate-950/35 p-3 flex items-start justify-between gap-3">
                     <div className="flex flex-col gap-1.5">
-                      <label className="text-[10px] text-slate-550 font-bold">
+                      <label className="text-[10px] text-slate-500 font-bold">
                         移除 Claude Code 的 billing header
                       </label>
                       <span className="text-[10px] text-slate-500 leading-relaxed">
@@ -3573,6 +3014,44 @@ const openai = new OpenAI({
         </div>
       )}
       {modalLogId && renderDetailModal()}
+
+      {/* 通用确认 / 提示对话框（替代 window.confirm / alert） */}
+      {dialog && (
+        <div
+          className="fixed inset-0 bg-slate-950/75 backdrop-blur-sm z-[60] flex items-center justify-center p-4 modal-fade-in"
+          onClick={() => closeDialog(false)}
+        >
+          <div
+            className="glass-panel w-full max-w-md overflow-hidden flex flex-col border border-slate-800/85 shadow-[0_20px_50px_rgba(0,0,0,0.85)] modal-scale-up"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center gap-2 px-5 py-4 border-b border-slate-900">
+              <span className="text-base font-bold text-slate-100">
+                {dialog.type === "confirm" ? "请确认" : "提示"}
+              </span>
+            </div>
+            <div className="px-5 py-5 text-sm text-slate-300 leading-relaxed whitespace-pre-wrap">
+              {dialog.message}
+            </div>
+            <div className="flex justify-end gap-3 px-5 py-3.5 border-t border-slate-900 bg-slate-950/40">
+              {dialog.type === "confirm" && (
+                <button
+                  onClick={() => closeDialog(false)}
+                  className="btn-secondary text-xs px-4 py-2.5 hover:bg-slate-800 transition-all duration-200 font-semibold"
+                >
+                  取消
+                </button>
+              )}
+              <button
+                onClick={() => closeDialog(dialog.type === "confirm")}
+                className="btn-primary btn-glow-cyan text-xs px-5 py-2.5 transition-all duration-200"
+              >
+                {dialog.type === "confirm" ? "确定" : "知道了"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
