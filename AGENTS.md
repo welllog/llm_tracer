@@ -17,3 +17,17 @@
 
 - 会话归属问题一旦修复，必须把触发问题的真实请求/响应日志样本脱敏后直接写进 `main_test.go`，作为回归测试夹具。
 - 单测不得依赖 `data/llm_tracer.db` 或任何持久化 db 文件；测试必须使用临时数据库或纯内存样本。
+
+## Agent skills
+
+### Issue tracker
+
+Issue 跟踪使用本地 Markdown 文件，存储在 `.scratch/` 目录下。参见 [docs/agents/issue-tracker.md](docs/agents/issue-tracker.md)。
+
+### Triage labels
+
+使用默认的分拣标签词汇表。参见 [docs/agents/triage-labels.md](docs/agents/triage-labels.md)。
+
+### Domain docs
+
+项目采用单上下文结构。参见 [docs/agents/domain.md](docs/agents/domain.md)。

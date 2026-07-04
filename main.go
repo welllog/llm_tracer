@@ -572,7 +572,7 @@ func main() {
 				IdleConnTimeout:     90 * time.Second,
 				TLSHandshakeTimeout: 10 * time.Second,
 				// 上游迟迟不返回响应头时及时失败，避免无限等待
-				ResponseHeaderTimeout: 60 * time.Second,
+				ResponseHeaderTimeout: 300 * time.Second,
 			},
 		},
 		lastActiveSessionMap: make(map[string]string),
