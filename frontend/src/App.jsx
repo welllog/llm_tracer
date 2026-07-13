@@ -351,7 +351,7 @@ function formatTokenCount(n) {
 // ==========================================
 // 日志详情组件：modal 与 inline 共用同一份渲染
 // ==========================================
-function LogDetail({ log, isLoading, sessionContext, onOpenSubLog, defaultTab = "trace" }) {
+function LogDetail({ log, isLoading, sessionContext, onOpenSubLog, onEnsureLoaded, onLoadMore, defaultTab = "trace" }) {
   const [activeTab, setActiveTab] = useState(defaultTab);
   const [selectedToolIndex, setSelectedToolIndex] = useState(0);
   const [toolSearchQuery, setToolSearchQuery] = useState("");
@@ -368,24 +368,30 @@ function LogDetail({ log, isLoading, sessionContext, onOpenSubLog, defaultTab = 
 
   const sessionLogs = sessionContext?.logs || [];
   const isSessionLoading = sessionContext?.isLoading || false;
-  const totalSessionTokens = sessionLogs.reduce(
-    (sum, l) => sum + (l.totalTokens || 0),
-    0,
-  );
-  const totalSessionInputTokens = sessionLogs.reduce(
-    (sum, l) => sum + (l.inputTokens || 0),
-    0,
-  );
-  const totalSessionOutputTokens = sessionLogs.reduce(
-    (sum, l) => sum + (l.outputTokens || 0),
-    0,
-  );
-  const totalSessionCachedTokens = sessionLogs.reduce(
-    (sum, l) => sum + (l.cachedTokens || 0),
-    0,
-  );
+  // 总额优先取会话级 lifetime（sessions 表，随首响应返回）；未加载时回退到已加载轮次的 reduce。
+  const st = sessionContext?.totals;
+  const totalSessionTokens =
+    st?.totalTokens ?? sessionLogs.reduce((s, l) => s + (l.totalTokens || 0), 0);
+  const totalSessionCachedTokens =
+    st?.totalInputCachedTokens ??
+    sessionLogs.reduce((s, l) => s + (l.cachedTokens || 0), 0);
   const totalSessionUncachedInputTokens =
-    totalSessionInputTokens - totalSessionCachedTokens;
+    st?.totalInputUncachedTokens ??
+    sessionLogs.reduce((s, l) => s + (l.inputTokens || 0), 0) -
+      totalSessionCachedTokens;
+  const totalSessionOutputTokens =
+    st?.totalOutputTokens ??
+    sessionLogs.reduce((s, l) => s + (l.outputTokens || 0), 0);
+  // 轮次数取 lifetime messageCount，未加载时回退到已加载数。
+  const sessionTurnCount =
+    st?.messageCount ?? sessionContext?.total ?? sessionLogs.length;
+
+  // S2: 用户切到「会话历史」tab 时才懒加载该会话的时间轴。
+  useEffect(() => {
+    if (activeTab === "session" && log?.sessionId) {
+      onEnsureLoaded?.(log.sessionId);
+    }
+  }, [activeTab, log?.sessionId, onEnsureLoaded]);
 
   // 渲染子代理会话的内联时间链
   const renderSubLogsForTool = (toolCallId) => {
@@ -931,7 +937,7 @@ function LogDetail({ log, isLoading, sessionContext, onOpenSubLog, defaultTab = 
               <div className="flex items-center gap-2">
                 <span>🔗 会话轮次目录 / 点击可快速定位详情</span>
                 <span className="font-mono text-cyan-400">
-                  ({sessionLogs.length} 轮对话 • 未缓存输入{" "}
+                  ({sessionTurnCount} 轮对话 • 未缓存输入{" "}
                   {totalSessionUncachedInputTokens} / 缓存{" "}
                   {totalSessionCachedTokens} / 输出{" "}
                   {totalSessionOutputTokens} / 共 {totalSessionTokens} Tokens)
@@ -1179,6 +1185,21 @@ function LogDetail({ log, isLoading, sessionContext, onOpenSubLog, defaultTab = 
                     </div>
                   );
                 })}
+                {sessionContext?.hasMore && (
+                  <button
+                    onClick={() => onLoadMore?.()}
+                    disabled={sessionContext?.isLoadingMore}
+                    className={`self-start ml-3 mt-1 text-[10px] font-semibold px-3 py-1.5 rounded-lg border transition-all active:scale-95 ${
+                      sessionContext?.isLoadingMore
+                        ? "text-slate-500 bg-slate-950/40 border-slate-800/60 cursor-wait"
+                        : "text-cyan-400 hover:text-cyan-300 bg-cyan-950/30 hover:bg-cyan-950/50 border-cyan-900/40 cursor-pointer"
+                    }`}
+                  >
+                    {sessionContext?.isLoadingMore
+                      ? "加载中..."
+                      : `加载更多（${sessionLogs.length}/${sessionContext?.total ?? sessionLogs.length}）`}
+                  </button>
+                )}
               </div>
             )}
           </div>
@@ -1321,26 +1342,17 @@ export default function App() {
   // 筛选与搜索
   const [searchInput, setSearchInput] = useState("");
   const [searchKeyword, setSearchKeyword] = useState("");
+  // 会话时间轴：分页懒加载（S1/S2）。sessionStats = 该会话 lifetime 总额（来自 sessions 表）。
   const [sessionLogs, setSessionLogs] = useState([]);
-  const totalSessionTokens = sessionLogs.reduce(
-    (sum, log) => sum + (log.totalTokens || 0),
-    0,
-  );
-  const totalSessionInputTokens = sessionLogs.reduce(
-    (sum, log) => sum + (log.inputTokens || 0),
-    0,
-  );
-  const totalSessionOutputTokens = sessionLogs.reduce(
-    (sum, log) => sum + (log.outputTokens || 0),
-    0,
-  );
-  const totalSessionCachedTokens = sessionLogs.reduce(
-    (sum, log) => sum + (log.cachedTokens || 0),
-    0,
-  );
-  const totalSessionUncachedInputTokens =
-    totalSessionInputTokens - totalSessionCachedTokens;
+  const [sessionLogsTotal, setSessionLogsTotal] = useState(0);
+  const [sessionStats, setSessionStats] = useState(null);
+  const loadedSessionRef = useRef(null); // 当前已加载时间轴的 sessionId
+  const sessionPageRef = useRef(0); // 当前已加载到第几页
+  const sessionReqTokenRef = useRef(0); // 单调递增的请求令牌：作废在途请求，防迟到的响应写脏新会话
   const [isSessionLoading, setIsSessionLoading] = useState(false);
+  // S2: 加载更多（page>1 追加）时的轻量态。与 isSessionLoading 区分——
+  // 追加不能把已渲染列表整段卸载换成 spinner，否则会话历史滚动位置会丢失。
+  const [isSessionLoadingMore, setIsSessionLoadingMore] = useState(false);
   const [providerFilter, setProviderFilter] = useState("all");
   const [statusFilter, setStatusFilter] = useState("all");
 
@@ -1415,8 +1427,6 @@ export default function App() {
 
   // 轮询计数器与定时器引用
   const autoRefreshTimer = useRef(null);
-  // 会话卡片点击时的 fetch controller：新点击会取消旧请求，避免竞态
-  const sessionClickAbort = useRef(null);
 
   // 动态计算本地代理根地址
   const proxyBase = (() => {
@@ -1462,18 +1472,36 @@ export default function App() {
     async (page = 1) => {
       setIsLogsLoading(true);
       try {
-        let url = `/api/logs?page=${page}&pageSize=${pageSize}`;
-        if (providerFilter !== "all") url += `&provider=${providerFilter}`;
-        if (statusFilter !== "all") url += `&status=${statusFilter}`;
-        if (searchKeyword.trim() !== "")
-          url += `&keyword=${encodeURIComponent(searchKeyword)}`;
+        const buildUrl = (p) => {
+          let url = `/api/logs?page=${p}&pageSize=${pageSize}`;
+          if (providerFilter !== "all") url += `&provider=${providerFilter}`;
+          if (statusFilter !== "all") url += `&status=${statusFilter}`;
+          if (searchKeyword.trim() !== "")
+            url += `&keyword=${encodeURIComponent(searchKeyword)}`;
+          return url;
+        };
 
-        const res = await fetch(url);
+        const res = await fetch(buildUrl(page));
         if (res.ok) {
-          const data = await res.json();
-          setLogs(data.list || []);
-          setTotalLogs(data.total || 0);
-          setCurrentPage(data.page || 1);
+          let data = await res.json();
+          let list = data.list || [];
+          let total = data.total || 0;
+          let cur = data.page || page;
+          // 空页回退：删除最后一页末项后当前页变空、但仍有数据时，回到末页，
+          // 避免停在空列表 + 失效的分页（如「2/1」）。
+          if (list.length === 0 && page > 1 && total > 0) {
+            const lastPage = Math.max(1, Math.ceil(total / pageSize));
+            const res2 = await fetch(buildUrl(lastPage));
+            if (res2.ok) {
+              const d2 = await res2.json();
+              list = d2.list || [];
+              total = d2.total || 0;
+              cur = d2.page || lastPage;
+            }
+          }
+          setLogs(list);
+          setTotalLogs(total);
+          setCurrentPage(cur);
         }
       } catch (err) {
         console.error("Failed to fetch logs:", err);
@@ -1488,16 +1516,36 @@ export default function App() {
     async (page = 1) => {
       setIsSessionsLoading(true);
       try {
-        let url = `/api/sessions?page=${page}&pageSize=${sessionPageSize}`;
-        if (searchKeyword.trim() !== "")
-          url += `&keyword=${encodeURIComponent(searchKeyword)}`;
+        const buildUrl = (p) => {
+          let url = `/api/sessions?page=${p}&pageSize=${sessionPageSize}`;
+          if (searchKeyword.trim() !== "")
+            url += `&keyword=${encodeURIComponent(searchKeyword)}`;
+          return url;
+        };
 
-        const res = await fetch(url);
+        const res = await fetch(buildUrl(page));
         if (res.ok) {
-          const data = await res.json();
-          setSessions(data.list || []);
-          setTotalSessions(data.total || 0);
-          setCurrentSessionPage(data.page || 1);
+          let data = await res.json();
+          let list = data.list || [];
+          let total = data.total || 0;
+          let cur = data.page || page;
+          // 空页回退：删除最后一页末项后当前页变空、但仍有数据时，回到末页。
+          if (list.length === 0 && page > 1 && total > 0) {
+            const lastPage = Math.max(
+              1,
+              Math.ceil(total / sessionPageSize),
+            );
+            const res2 = await fetch(buildUrl(lastPage));
+            if (res2.ok) {
+              const d2 = await res2.json();
+              list = d2.list || [];
+              total = d2.total || 0;
+              cur = d2.page || lastPage;
+            }
+          }
+          setSessions(list);
+          setTotalSessions(total);
+          setCurrentSessionPage(cur);
         }
       } catch (err) {
         console.error("Failed to fetch sessions:", err);
@@ -1508,24 +1556,81 @@ export default function App() {
     [searchKeyword, sessionPageSize],
   );
 
-  const fetchSessionLogs = useCallback(async (sessionId) => {
+  // 清空会话时间轴的全部状态（列表 + 缓存 ref + 分页游标）。
+  // 关键：loadedSessionRef 必须随 sessionLogs 一起清空，否则 ensureSessionLogs 会
+  // 因「ref 已指向该 session」而跳过重新拉取，导致切回该会话时显示"暂无历史记录"。
+  // 同时递增请求令牌作废所有在途 fetch——否则切会话时上一个会话慢到的响应会写脏新列表。
+  const resetSessionLogsState = useCallback(() => {
+    sessionReqTokenRef.current++;
+    setSessionLogs([]);
+    setSessionLogsTotal(0);
+    setSessionStats(null);
+    setIsSessionLoading(false);
+    setIsSessionLoadingMore(false);
+    loadedSessionRef.current = null;
+    sessionPageRef.current = 0;
+  }, []);
+
+  // S1: 会话时间轴分页加载。page=1 替换、page>1 追加；响应带 total 与 session(lifetime 总额)。
+  // page>1（加载更多）用 isSessionLoadingMore 轻量态，绝不翻 isSessionLoading--
+  // 后者会把整段已渲染列表卸载成 spinner，追加完成后重新挂载，会话历史滚动位置丢失。
+  const fetchSessionLogs = useCallback(async (sessionId, page = 1) => {
     if (!sessionId) {
-      setSessionLogs([]);
+      resetSessionLogsState();
       return;
     }
-    setIsSessionLoading(true);
+    const isAppend = page > 1;
+    if (isAppend) setIsSessionLoadingMore(true);
+    else setIsSessionLoading(true);
+    // 仅接受最新一次请求的响应：切会话/重置都会递增令牌，旧响应到达时令牌不匹配即丢弃。
+    const token = ++sessionReqTokenRef.current;
     try {
-      const res = await fetch(`/api/sessions/${sessionId}/logs`);
+      const res = await fetch(
+        `/api/sessions/${sessionId}/logs?page=${page}&pageSize=50`,
+      );
+      if (sessionReqTokenRef.current !== token) return;
       if (res.ok) {
         const data = await res.json();
-        setSessionLogs(data || []);
+        if (sessionReqTokenRef.current !== token) return;
+        const list = data.list || [];
+        setSessionLogs((prev) => (page === 1 ? list : [...prev, ...list]));
+        setSessionLogsTotal(data.total || 0);
+        sessionPageRef.current = page;
+        loadedSessionRef.current = sessionId;
+        if (data.session) setSessionStats(data.session);
       }
     } catch (err) {
       console.error("Failed to fetch session logs:", err);
     } finally {
-      setIsSessionLoading(false);
+      // 仅当仍是最新请求时才清 loading 态；否则已被 resetSessionLogsState 接管。
+      if (sessionReqTokenRef.current === token) {
+        if (isAppend) setIsSessionLoadingMore(false);
+        else setIsSessionLoading(false);
+      }
     }
-  }, []);
+  }, [resetSessionLogsState]);
+
+  // S2: 仅在用户切到「会话历史」tab 时才拉取会话时间轴，替代 fetchLogDetail 的无条件级联。
+  const ensureSessionLogs = useCallback(
+    (sessionId) => {
+      if (!sessionId) return;
+      if (loadedSessionRef.current !== sessionId) {
+        resetSessionLogsState();
+        loadedSessionRef.current = sessionId;
+        fetchSessionLogs(sessionId, 1);
+      }
+    },
+    [fetchSessionLogs, resetSessionLogsState],
+  );
+
+  // S1: 滚动到底部加载下一页。
+  const loadMoreSessionLogs = useCallback(() => {
+    const sid = loadedSessionRef.current;
+    if (!sid) return;
+    if (sessionLogs.length < sessionLogsTotal) {
+      fetchSessionLogs(sid, (sessionPageRef.current || 1) + 1);
+    }
+  }, [fetchSessionLogs, sessionLogs.length, sessionLogsTotal]);
 
   const fetchLogDetail = useCallback(
     async (id) => {
@@ -1536,11 +1641,11 @@ export default function App() {
         if (res.ok) {
           const data = await res.json();
           setSelectedLog(data);
-          if (data.sessionId) {
-            fetchSessionLogs(data.sessionId);
-          } else {
-            setSessionLogs([]);
-          }
+          // S2: 不再无条件级联拉取整个会话；由 LogDetail 在「会话历史」tab 激活时按需懒加载。
+        } else {
+          // 非 2xx（如日志已被删除、后端返回 500）：清掉旧 selectedLog，让 LogDetail
+          // 的 !log 兜底显示「加载日志失败」错误态，而不是停留在上一条 log 上误导用户。
+          setSelectedLog(null);
         }
       } catch (err) {
         console.error("Failed to fetch log detail:", err);
@@ -1548,7 +1653,7 @@ export default function App() {
         setIsLogLoading(false);
       }
     },
-    [fetchSessionLogs],
+    [],
   );
 
   // 删除单个日志
@@ -1599,7 +1704,9 @@ export default function App() {
         if (selectedLog && selectedLog.sessionId === sessionId) {
           setSelectedLogId(null);
         }
-        // 重新获取日志列表与用量统计
+        // 删除会话同时影响两个视图：会话列表少一行、请求列表少该会话所有 log。
+        // 两边都刷新，否则会话浏览里会残留已被删除的卡片，点击它取详情会 500。
+        fetchSessions(currentSessionPage);
         fetchLogs(currentPage);
         fetchStats();
       } else {
@@ -1736,8 +1843,8 @@ export default function App() {
     // 切换模式时清空右侧选中内容，保持界面整洁
     setSelectedLogId(null);
     setSelectedLog(null);
-    setSessionLogs([]);
-  }, [viewMode, fetchLogs, fetchSessions]);
+    resetSessionLogsState();
+  }, [viewMode, fetchLogs, fetchSessions, resetSessionLogsState]);
 
   // 轮询更新列表和用量统计（接口返回后再延迟 5 秒）
   useEffect(() => {
@@ -1753,9 +1860,10 @@ export default function App() {
       if (shouldRefreshList) {
         if (viewMode === "logs") await fetchLogs(1);
         else await fetchSessions(1);
+        // S3：stats（全表聚合）只在列表确有刷新时一起刷新，不再每 5s 盲拉；
+        // 其余时候靠挂载与手动刷新。避免后台周期性全表扫阻塞单连接。
+        await fetchStats();
       }
-      // 统计数据轻量，无焦点时也照常拉取
-      await fetchStats();
 
       if (!cancelled) {
         autoRefreshTimer.current = setTimeout(loop, 5000);
@@ -1786,9 +1894,9 @@ export default function App() {
       fetchLogDetail(selectedLogId);
     } else {
       setSelectedLog(null);
-      setSessionLogs([]);
+      resetSessionLogsState();
     }
-  }, [selectedLogId, fetchLogDetail]);
+  }, [selectedLogId, fetchLogDetail, resetSessionLogsState]);
 
   // 当弹窗日志 ID 改变时加载弹窗详情
   useEffect(() => {
@@ -2024,36 +2132,14 @@ export default function App() {
       <div
         key={session.sessionId}
         onClick={() => {
-          if (session.sessionId.startsWith("standalone-")) {
-            setSelectedLogId(
-              parseInt(session.sessionId.replace("standalone-", "")),
-            );
-            setInlineDefaultTab("trace");
-          } else {
-            // 取消上一次未完成的会话点击请求，避免快速切换时旧响应覆盖新选中
-            if (sessionClickAbort.current) {
-              sessionClickAbort.current.abort();
-            }
-            const controller = new AbortController();
-            sessionClickAbort.current = controller;
-            // 获取会话的第一条日志作为详情展示
-            fetch(`/api/sessions/${session.sessionId}/logs`, {
-              signal: controller.signal,
-            })
-              .then((res) => res.json())
-              .then((logs) => {
-                if (logs && logs.length > 0) {
-                  setSelectedLogId(logs[0].id);
-                  // 会话模式点击后，右侧默认展示会话历史（时间轴）
-                  setInlineDefaultTab("session");
-                }
-              })
-              .catch((err) => {
-                if (err.name !== "AbortError") {
-                  console.error("Failed to fetch session logs:", err);
-                }
-              });
-          }
+          // C5：直接用后端预算的 firstLogId（SessionMetadata.firstLogId），免去
+          // 「拉整个会话只为取 logs[0].id」的冗余请求。真正展开会话看时间轴时，
+          // 由 fetchLogDetail 的级联按需加载一次。
+          if (!session.firstLogId) return;
+          setSelectedLogId(session.firstLogId);
+          setInlineDefaultTab(
+            session.sessionId.startsWith("standalone-") ? "trace" : "session",
+          );
         }}
         className={`group relative p-4 rounded-2xl border transition-all cursor-pointer ${
           isSelected
@@ -2456,8 +2542,14 @@ export default function App() {
               sessionContext={{
                 logs: sessionLogs,
                 isLoading: isSessionLoading,
+                isLoadingMore: isSessionLoadingMore,
                 onDelete: handleDeleteSessionLogs,
+                total: sessionLogsTotal,
+                totals: sessionStats,
+                hasMore: sessionLogs.length < sessionLogsTotal,
               }}
+              onEnsureLoaded={ensureSessionLogs}
+              onLoadMore={loadMoreSessionLogs}
               onOpenSubLog={setModalLogId}
             />
           )}

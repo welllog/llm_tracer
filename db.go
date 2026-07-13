@@ -95,6 +95,7 @@ type SessionMetadata struct {
 	MessageCount             int    `json:"messageCount"`
 	Model                    string `json:"model"`
 	Provider                 string `json:"provider"`
+	FirstLogID               int64  `json:"firstLogId,omitempty"`
 }
 
 func (log *LogSummary) normalizeAnthropicTokens() {
@@ -175,7 +176,8 @@ func (mgr *DBManager) createTables() error {
 		session_id TEXT,
 		client_fingerprint TEXT,
 		parent_id INTEGER,
-		parent_tool_call_id TEXT
+		parent_tool_call_id TEXT,
+		session_seq INTEGER NOT NULL DEFAULT 0
 	);
 	CREATE INDEX IF NOT EXISTS idx_logs_created_at ON logs(created_at DESC);
 	CREATE INDEX IF NOT EXISTS idx_logs_provider ON logs(provider);
@@ -188,6 +190,23 @@ func (mgr *DBManager) createTables() error {
 		handle_value TEXT NOT NULL,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
+	CREATE TABLE IF NOT EXISTS sessions (
+		session_id         TEXT PRIMARY KEY,
+		first_log_id       INTEGER NOT NULL,
+		last_log_id        INTEGER NOT NULL,
+		start_time         TEXT NOT NULL,
+		end_time           TEXT NOT NULL,
+		msg_count          INTEGER NOT NULL DEFAULT 0,
+		sum_tokens         INTEGER NOT NULL DEFAULT 0,
+		sum_input_uncached INTEGER NOT NULL DEFAULT 0,
+		sum_input_cached   INTEGER NOT NULL DEFAULT 0,
+		sum_output         INTEGER NOT NULL DEFAULT 0,
+		last_model         TEXT NOT NULL DEFAULT '',
+		last_provider      TEXT NOT NULL DEFAULT '',
+		summary            TEXT NOT NULL DEFAULT '',
+		summary_finalized  INTEGER NOT NULL DEFAULT 0
+	);
+	CREATE INDEX IF NOT EXISTS idx_sessions_last_log_id ON sessions(last_log_id DESC);
 	`
 	_, err := mgr.db.Exec(schema)
 	if err != nil {
@@ -202,7 +221,142 @@ func (mgr *DBManager) createTables() error {
 	_, _ = mgr.db.Exec("CREATE INDEX IF NOT EXISTS idx_log_handles_kind_value ON log_handles(handle_kind, handle_value);")
 	_, _ = mgr.db.Exec("CREATE INDEX IF NOT EXISTS idx_log_handles_log_id ON log_handles(log_id);")
 	_, _ = mgr.db.Exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_log_handles_unique_entry ON log_handles(log_id, source, handle_kind, handle_value);")
+
+	// === MIGRATION CODE（pre-C1 → C1，ADR-0001）=========================
+	// 把旧库（无 sessions 表 / logs 无 session_seq 列）迁到物化会话架构。
+	// 幂等：sessions 已填充时为 no-op；被清空则从 logs（真相源）自愈重建。
+	// 待所有部署库都升级到 C1 后，可整体删除 backfillSessions + computeSessionSummaryInTx
+	// + 本调用（runtime 路径 InsertLog/DeleteLog 不依赖它们）。
+	if berr := mgr.backfillSessions(); berr != nil {
+		return fmt.Errorf("backfill sessions: %w", berr)
+	}
 	return err
+}
+
+// backfillSessions 是 C1 迁移的入口（MIGRATION CODE，见 createTables 调用点注释）。
+// 在 sessions 表为空时从 logs 重建会话实体（ADR-0001）。已填充则跳过（no-op）；
+// sessions 被清空后下次启动即自愈重建。全程一个事务，保证原子。
+func (mgr *DBManager) backfillSessions() error {
+	var n int
+	if err := mgr.db.QueryRow("SELECT COUNT(*) FROM sessions").Scan(&n); err != nil {
+		return err
+	}
+	if n > 0 {
+		return nil
+	}
+
+	// 0. 老库 logs 表无 session_seq 列（CREATE TABLE IF NOT EXISTS 不会补）；补上。
+	//    列已存在时 ALTER 返回错误，忽略即可。仅 pre-C1 迁移路径需要。
+	_, _ = mgr.db.Exec("ALTER TABLE logs ADD COLUMN session_seq INTEGER NOT NULL DEFAULT 0")
+
+	tx, err := mgr.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// 1. 空 session_id -> 'standalone-<id>'，回写 logs.session_id，使 join 键统一。
+	if _, err = tx.Exec("UPDATE logs SET session_id = 'standalone-' || id WHERE session_id IS NULL OR session_id = ''"); err != nil {
+		return fmt.Errorf("backfill standalone keys: %w", err)
+	}
+
+	// 2. logs.session_seq = lifetime 位次（按 session_id 分组、id 升序编号；现存数据无删除，连续 1..N）。
+	if _, err = tx.Exec(`
+		UPDATE logs SET session_seq = (
+			SELECT rn FROM (
+				SELECT id, ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY id ASC) AS rn FROM logs
+			) WHERE id = logs.id
+		)
+	`); err != nil {
+		return fmt.Errorf("backfill session_seq: %w", err)
+	}
+
+	// 3. sessions 聚合（last_model/provider 取最新一条 log 的值，而非 MAX(model)）。
+	if _, err = tx.Exec(`
+		WITH agg AS (
+			SELECT session_id, MIN(id) first_id, MAX(id) last_id,
+			       MIN(created_at) st, MAX(created_at) et,
+			       COUNT(*) mc, SUM(total_tokens) st_tok,
+			       SUM(CASE WHEN provider='anthropic' THEN input_tokens ELSE input_tokens - cached_tokens END) siu,
+			       SUM(CASE WHEN provider='anthropic' THEN cache_read_tokens ELSE cached_tokens END) sic,
+			       SUM(output_tokens) so_tok
+			FROM logs GROUP BY session_id
+		)
+		INSERT INTO sessions (session_id, first_log_id, last_log_id, start_time, end_time,
+			msg_count, sum_tokens, sum_input_uncached, sum_input_cached, sum_output,
+			last_model, last_provider, summary, summary_finalized)
+		SELECT a.session_id, a.first_id, a.last_id, a.st, a.et, a.mc, a.st_tok, a.siu, a.sic, a.so_tok,
+		       l.model, l.provider, '', 0
+		FROM agg a JOIN logs l ON l.id = a.last_id
+	`); err != nil {
+		return fmt.Errorf("backfill sessions aggregates: %w", err)
+	}
+
+	// 4. summary 回填：逐会话扫 prompt_json，取 lifetime 首条 meaningful（命中即短路）；无则首条非空作暂存。
+	sRows, err := tx.Query("SELECT session_id FROM sessions")
+	if err != nil {
+		return err
+	}
+	var sessionIDs []string
+	for sRows.Next() {
+		var sid string
+		if err = sRows.Scan(&sid); err == nil {
+			sessionIDs = append(sessionIDs, sid)
+		}
+	}
+	sRows.Close()
+
+	for _, sid := range sessionIDs {
+		summary, finalized, err := computeSessionSummaryInTx(tx, sid)
+		if err != nil {
+			return fmt.Errorf("compute summary for %s: %w", sid, err)
+		}
+		if _, err = tx.Exec("UPDATE sessions SET summary = ?, summary_finalized = ? WHERE session_id = ?",
+			summary, finalized, sid); err != nil {
+			return fmt.Errorf("update summary for %s: %w", sid, err)
+		}
+	}
+
+	return tx.Commit()
+}
+
+// computeSessionSummaryInTx 是 backfillSessions 的专用 helper（MIGRATION CODE，
+// 随 backfillSessions 一并移除）。按会话扫 logs（id 升序）取 lifetime 摘要：
+// 首条 meaningful user 消息命中即返回(finalized=1)；否则记首条非空作暂存，扫完返回(finalized=0)。
+func computeSessionSummaryInTx(tx *sql.Tx, sessionID string) (string, int, error) {
+	rows, err := tx.Query("SELECT COALESCE(prompt_json,'') FROM logs WHERE session_id = ? ORDER BY id ASC", sessionID)
+	if err != nil {
+		return "", 0, err
+	}
+	defer rows.Close()
+
+	var tentative string
+	haveTentative := false
+	for rows.Next() {
+		var promptStr string
+		if err := rows.Scan(&promptStr); err != nil {
+			return "", 0, err
+		}
+		if promptStr == "" {
+			continue
+		}
+		var msgs []ChatMessage
+		if err := json.Unmarshal([]byte(promptStr), &msgs); err != nil {
+			continue
+		}
+		cand := extractPromptSummary(msgs)
+		if cand == "" {
+			continue
+		}
+		if !haveTentative {
+			tentative = cand
+			haveTentative = true
+		}
+		if isMeaningfulSummary(cand) {
+			return cand, 1, nil
+		}
+	}
+	return tentative, 0, nil
 }
 
 func (mgr *DBManager) InsertLog(log *UnifiedLog) (int64, error) {
@@ -231,8 +385,8 @@ func (mgr *DBManager) InsertLog(log *UnifiedLog) (int64, error) {
 		prompt_json, response_json, tools_json,
 		raw_request, raw_response, error_message, created_at, session_id,
 		cached_tokens, cache_read_tokens, cache_creation_tokens, parent_id,
-		parent_tool_call_id, client_fingerprint
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		parent_tool_call_id, client_fingerprint, session_seq
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`
 
 	createdAt := time.Now().UTC().Format("2006-01-02 15:04:05")
@@ -242,6 +396,27 @@ func (mgr *DBManager) InsertLog(log *UnifiedLog) (int64, error) {
 	}
 	defer tx.Rollback()
 
+	// 预读会话状态以算 session_seq（lifetime 位次 = msg_count+1）与 summary 规则。
+	// standalone（空 session_id）必为新会话、位次 1，键待 insert 后用 logID 合成。
+	sessionKey := log.SessionID
+	isStandalone := strings.TrimSpace(sessionKey) == ""
+	isNew := isStandalone
+	var preMsgCount int64
+	var preSummary string
+	var preFinalized int
+	sessionSeq := int64(1)
+	if !isStandalone {
+		e := tx.QueryRow("SELECT msg_count, summary, summary_finalized FROM sessions WHERE session_id = ?", sessionKey).
+			Scan(&preMsgCount, &preSummary, &preFinalized)
+		if e == sql.ErrNoRows {
+			isNew = true
+		} else if e != nil {
+			return 0, e
+		} else {
+			sessionSeq = preMsgCount + 1
+		}
+	}
+
 	res, err := tx.Exec(
 		query,
 		log.Provider, log.Model, log.Path, log.StatusCode, log.DurationMs,
@@ -249,7 +424,7 @@ func (mgr *DBManager) InsertLog(log *UnifiedLog) (int64, error) {
 		string(promptJSON), string(respJSON), string(toolsJSON),
 		log.RawRequest, log.RawResponse, log.ErrorMessage, createdAt, log.SessionID,
 		log.CachedTokens, log.CacheReadTokens, log.CacheCreationTokens, log.ParentID,
-		log.ParentToolCallID, log.ClientFingerprint,
+		log.ParentToolCallID, log.ClientFingerprint, sessionSeq,
 	)
 	if err != nil {
 		return 0, err
@@ -260,6 +435,14 @@ func (mgr *DBManager) InsertLog(log *UnifiedLog) (int64, error) {
 		return 0, err
 	}
 
+	// standalone：合成 'standalone-<logID>' 回写 logs.session_id，使 join 键统一。
+	if isStandalone {
+		sessionKey = "standalone-" + strconv.FormatInt(logID, 10)
+		if _, err := tx.Exec("UPDATE logs SET session_id = ? WHERE id = ?", sessionKey, logID); err != nil {
+			return 0, fmt.Errorf("update standalone session_id: %w", err)
+		}
+	}
+
 	if err := insertConversationHandles(tx, logID, "request", log.RequestHandles); err != nil {
 		return 0, err
 	}
@@ -267,11 +450,76 @@ func (mgr *DBManager) InsertLog(log *UnifiedLog) (int64, error) {
 		return 0, err
 	}
 
+	// 维护 sessions 实体（ADR-0001）：增量 upsert 聚合 + lifetime 摘要。
+	if err := mgr.upsertSession(tx, log, logID, sessionKey, isNew, preSummary, preFinalized, createdAt); err != nil {
+		return 0, fmt.Errorf("upsert session: %w", err)
+	}
+
 	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
 
 	return logID, nil
+}
+
+// upsertSession 在 InsertLog 事务内维护 sessions 行。新会话 INSERT；已存在 UPDATE：
+// lifetime 字段（msg_count/sum_*/summary）按规则更新；current 字段（last_log_id/end_time/
+// last_model/last_provider）每次刷新。token 增量按行 provider 分流（raw 值，与读时 normalize 解耦）。
+func (mgr *DBManager) upsertSession(tx *sql.Tx, log *UnifiedLog, logID int64, sessionKey string, isNew bool, preSummary string, preFinalized int, createdAt string) error {
+	// 用内存 log.Prompt 现算本轮候选（零 DB 读）。
+	newSummary := extractPromptSummary(log.Prompt)
+	newMeaningful := isMeaningfulSummary(newSummary)
+
+	var sumInputUncached, sumInputCached int
+	if log.Provider == "anthropic" {
+		sumInputUncached = log.InputTokens
+		sumInputCached = log.CacheReadTokens
+	} else {
+		sumInputUncached = log.InputTokens - log.CachedTokens
+		sumInputCached = log.CachedTokens
+	}
+
+	if isNew {
+		finalized := 0
+		if newMeaningful {
+			finalized = 1
+		}
+		_, err := tx.Exec(`INSERT INTO sessions
+			(session_id, first_log_id, last_log_id, start_time, end_time, msg_count,
+			 sum_tokens, sum_input_uncached, sum_input_cached, sum_output,
+			 last_model, last_provider, summary, summary_finalized)
+			VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			sessionKey, logID, logID, createdAt, createdAt,
+			log.TotalTokens, sumInputUncached, sumInputCached, log.OutputTokens,
+			log.Model, log.Provider, newSummary, finalized)
+		return err
+	}
+
+	// lifetime 摘要规则：已冻结则不动；否则首条非空作暂存，命中 meaningful 升级并冻结。
+	keepSummary := preSummary
+	keepFinalized := preFinalized
+	if preFinalized == 0 && newSummary != "" {
+		if preSummary == "" {
+			keepSummary = newSummary
+			if newMeaningful {
+				keepFinalized = 1
+			}
+		} else if newMeaningful {
+			keepSummary = newSummary
+			keepFinalized = 1
+		}
+	}
+
+	_, err := tx.Exec(`UPDATE sessions SET
+		last_log_id = ?, end_time = ?, msg_count = msg_count + 1,
+		sum_tokens = sum_tokens + ?, sum_input_uncached = sum_input_uncached + ?,
+		sum_input_cached = sum_input_cached + ?, sum_output = sum_output + ?,
+		last_model = ?, last_provider = ?, summary = ?, summary_finalized = ?
+		WHERE session_id = ?`,
+		logID, createdAt,
+		log.TotalTokens, sumInputUncached, sumInputCached, log.OutputTokens,
+		log.Model, log.Provider, keepSummary, keepFinalized, sessionKey)
+	return err
 }
 
 func insertConversationHandles(tx *sql.Tx, logID int64, source string, handles []ConversationHandle) error {
@@ -349,15 +597,14 @@ func (mgr *DBManager) GetLogs(page, pageSize int, provider, model, keyword strin
 		return nil, 0, err
 	}
 
-	// 2. 获取分页数据
+	// 2. 获取分页数据：session_seq 直读列；会话摘要 JOIN sessions 取（替代窗口查询 N+1）。
 	dataQuery := fmt.Sprintf(`
 		SELECT l1.id, l1.provider, l1.model, l1.path, l1.status_code, l1.duration_ms, l1.input_tokens, l1.output_tokens, l1.total_tokens,
 		       COALESCE(l1.cached_tokens, 0), COALESCE(l1.cache_read_tokens, 0), COALESCE(l1.cache_creation_tokens, 0),
 		       datetime(l1.created_at, 'localtime'), COALESCE(l1.session_id, ''), l1.parent_id, COALESCE(l1.parent_tool_call_id, ''),
-		       CASE WHEN COALESCE(l1.session_id, '') != '' THEN
-		            (SELECT COUNT(*) FROM logs l2 WHERE l2.session_id = l1.session_id AND l2.id <= l1.id)
-		       ELSE 0 END as session_seq
+		       l1.session_seq, COALESCE(s.summary, '')
 		FROM logs l1
+		LEFT JOIN sessions s ON s.session_id = l1.session_id
 		WHERE %s
 		ORDER BY l1.created_at DESC, l1.id DESC
 		LIMIT ? OFFSET ?`, whereClause)
@@ -378,7 +625,7 @@ func (mgr *DBManager) GetLogs(page, pageSize int, provider, model, keyword strin
 			&s.DurationMs, &s.InputTokens, &s.OutputTokens, &s.TotalTokens,
 			&s.CachedTokens, &s.CacheReadTokens, &s.CacheCreationTokens,
 			&s.CreatedAt, &s.SessionID, &s.ParentID, &s.ParentToolCallID,
-			&s.SessionSeq,
+			&s.SessionSeq, &s.SessionSummary,
 		)
 		if err != nil {
 			return nil, 0, err
@@ -387,109 +634,97 @@ func (mgr *DBManager) GetLogs(page, pageSize int, provider, model, keyword strin
 		summaries = append(summaries, s)
 	}
 
-	// 提取当前页的所有 SessionID 并在 Go 层面进行去重
-	sessionIDs := []string{}
-	seen := make(map[string]bool)
-	for _, s := range summaries {
-		if s.SessionID != "" && !seen[s.SessionID] {
-			seen[s.SessionID] = true
-			sessionIDs = append(sessionIDs, s.SessionID)
-		}
-	}
-
-	if len(sessionIDs) > 0 {
-		placeholders := make([]string, len(sessionIDs))
-		queryArgs := make([]any, len(sessionIDs))
-		for i, id := range sessionIDs {
-			placeholders[i] = "?"
-			queryArgs[i] = id
-		}
-
-		// 使用窗口函数，查出每个会话最早的 3 条日志的 prompt_json
-		query := fmt.Sprintf(`
-			SELECT session_id, prompt_json
-			FROM (
-				SELECT COALESCE(session_id, '') as session_id, COALESCE(prompt_json, '') as prompt_json,
-				       ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY id ASC) as rn
-				FROM logs
-				WHERE session_id IN (%s)
-			)
-			WHERE rn <= 3
-		`, strings.Join(placeholders, ","))
-
-		subRows, err := mgr.db.Query(query, queryArgs...)
-		if err == nil {
-			summariesMap := make(map[string]string)
-			meaningfulMap := make(map[string]bool)
-			for subRows.Next() {
-				var sID, promptStr string
-				if err := subRows.Scan(&sID, &promptStr); err == nil && promptStr != "" {
-					if meaningfulMap[sID] {
-						continue
-					}
-					var msgs []ChatMessage
-					if err := json.Unmarshal([]byte(promptStr), &msgs); err == nil {
-						summary := extractPromptSummary(msgs)
-						if summary != "" {
-							if isMeaningfulSummary(summary) {
-								summariesMap[sID] = summary
-								meaningfulMap[sID] = true
-							} else if summariesMap[sID] == "" {
-								summariesMap[sID] = summary
-							}
-						}
-					}
-				}
-			}
-			subRows.Close()
-
-			for i := range summaries {
-				if sum, ok := summariesMap[summaries[i].SessionID]; ok {
-					summaries[i].SessionSummary = sum
-				}
-			}
-		}
-	}
-
 	return summaries, total, nil
 }
 
-func (mgr *DBManager) GetSessionLogs(sessionID string) ([]UnifiedLog, error) {
-	if sessionID == "" {
-		return nil, nil
-	}
+// sessionLogsSlimQuery 故意不查 raw_request / raw_response / tools_json：会话列表
+// 视图不需要它们，而每个轮次都携带累积历史，全量返回会让 payload 呈 O(N^2) 增长，
+// 长会话下达到数百 MB 直接撑爆浏览器渲染进程（Chrome error code 5 / OOM）。
+const sessionLogsSlimQuery = `
+		SELECT l1.id, l1.provider, l1.model, l1.path, l1.status_code, l1.duration_ms, l1.input_tokens, l1.output_tokens, l1.total_tokens,
+		       COALESCE(l1.cached_tokens, 0), COALESCE(l1.cache_read_tokens, 0), COALESCE(l1.cache_creation_tokens, 0),
+		       COALESCE(l1.prompt_json, ''), COALESCE(l1.response_json, ''), COALESCE(l1.error_message, ''),
+		       datetime(l1.created_at, 'localtime'), COALESCE(l1.session_id, ''), l1.parent_id, COALESCE(l1.parent_tool_call_id, ''),
+		       l1.session_seq
+		FROM logs l1
+		WHERE l1.session_id = ?
+		ORDER BY l1.id ASC
+		LIMIT ? OFFSET ?`
 
-	query := `
+// sessionLogsFullQuery 保留原始全量字段，仅在 ?full=1 调试时使用。
+const sessionLogsFullQuery = `
 		SELECT l1.id, l1.provider, l1.model, l1.path, l1.status_code, l1.duration_ms, l1.input_tokens, l1.output_tokens, l1.total_tokens,
 		       COALESCE(l1.cached_tokens, 0), COALESCE(l1.cache_read_tokens, 0), COALESCE(l1.cache_creation_tokens, 0),
 		       COALESCE(l1.prompt_json, ''), COALESCE(l1.response_json, ''), COALESCE(l1.tools_json, ''),
 		       COALESCE(l1.raw_request, ''), COALESCE(l1.raw_response, ''), COALESCE(l1.error_message, ''),
 		       datetime(l1.created_at, 'localtime'), COALESCE(l1.session_id, ''), l1.parent_id, COALESCE(l1.parent_tool_call_id, ''),
-		       (SELECT COUNT(*) FROM logs l2 WHERE l2.session_id = l1.session_id AND l2.id <= l1.id) as session_seq
+		       l1.session_seq
 		FROM logs l1
 		WHERE l1.session_id = ?
-		ORDER BY l1.id ASC`
+		ORDER BY l1.id ASC
+		LIMIT ? OFFSET ?`
 
-	rows, err := mgr.db.Query(query, sessionID)
+func (mgr *DBManager) GetSessionLogs(sessionID string, full bool, page, pageSize int) ([]UnifiedLog, int, error) {
+	if sessionID == "" {
+		return nil, 0, nil
+	}
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 {
+		pageSize = 50
+	}
+	offset := (page - 1) * pageSize
+
+	// 总数 = 该会话现存 log 数（非 sessions.msg_count 的 lifetime 值，分页以现存为准）。
+	var total int
+	if err := mgr.db.QueryRow("SELECT COUNT(*) FROM logs WHERE session_id = ?", sessionID).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+
+	query := sessionLogsSlimQuery
+	if full {
+		query = sessionLogsFullQuery
+	}
+
+	rows, err := mgr.db.Query(query, sessionID, pageSize, offset)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer rows.Close()
 
 	var logs []UnifiedLog
 	for rows.Next() {
 		var s UnifiedLog
-		var promptStr, respStr, toolsStr string
-		err := rows.Scan(
-			&s.ID, &s.Provider, &s.Model, &s.Path, &s.StatusCode, &s.DurationMs,
-			&s.InputTokens, &s.OutputTokens, &s.TotalTokens,
-			&s.CachedTokens, &s.CacheReadTokens, &s.CacheCreationTokens,
-			&promptStr, &respStr, &toolsStr, &s.RawRequest, &s.RawResponse, &s.ErrorMessage,
-			&s.CreatedAt, &s.SessionID, &s.ParentID, &s.ParentToolCallID,
-			&s.SessionSeq,
-		)
-		if err != nil {
-			return nil, err
+		var promptStr, respStr string
+		var toolsStr, rawReqStr, rawRespStr string
+
+		if full {
+			err := rows.Scan(
+				&s.ID, &s.Provider, &s.Model, &s.Path, &s.StatusCode, &s.DurationMs,
+				&s.InputTokens, &s.OutputTokens, &s.TotalTokens,
+				&s.CachedTokens, &s.CacheReadTokens, &s.CacheCreationTokens,
+				&promptStr, &respStr, &toolsStr, &rawReqStr, &rawRespStr, &s.ErrorMessage,
+				&s.CreatedAt, &s.SessionID, &s.ParentID, &s.ParentToolCallID,
+				&s.SessionSeq,
+			)
+			if err != nil {
+				return nil, 0, err
+			}
+			s.RawRequest = rawReqStr
+			s.RawResponse = rawRespStr
+		} else {
+			err := rows.Scan(
+				&s.ID, &s.Provider, &s.Model, &s.Path, &s.StatusCode, &s.DurationMs,
+				&s.InputTokens, &s.OutputTokens, &s.TotalTokens,
+				&s.CachedTokens, &s.CacheReadTokens, &s.CacheCreationTokens,
+				&promptStr, &respStr, &s.ErrorMessage,
+				&s.CreatedAt, &s.SessionID, &s.ParentID, &s.ParentToolCallID,
+				&s.SessionSeq,
+			)
+			if err != nil {
+				return nil, 0, err
+			}
 		}
 
 		if promptStr != "" {
@@ -502,17 +737,103 @@ func (mgr *DBManager) GetSessionLogs(sessionID string) ([]UnifiedLog, error) {
 				log.Printf("GetSessionLogs: failed to unmarshal response_json for log %d: %v", s.ID, err)
 			}
 		}
-		if toolsStr != "" {
+		if full && toolsStr != "" {
 			if err := json.Unmarshal([]byte(toolsStr), &s.Tools); err != nil {
 				log.Printf("GetSessionLogs: failed to unmarshal tools_json for log %d: %v", s.ID, err)
 			}
 		}
 
 		s.normalizeAnthropicTokens()
+		if !full {
+			trimSessionLogForList(&s)
+		}
 		logs = append(logs, s)
 	}
 
-	return logs, nil
+	return logs, total, nil
+}
+
+// GetSessionByID 取单个会话的元数据（用于会话详情视图的总额/轮数等，来自 sessions 表）。
+func (mgr *DBManager) GetSessionByID(sessionID string) (*SessionMetadata, error) {
+	if sessionID == "" {
+		return nil, nil
+	}
+	var s SessionMetadata
+	err := mgr.db.QueryRow(`
+		SELECT session_id, datetime(start_time,'localtime'), datetime(end_time,'localtime'),
+		       sum_tokens, sum_input_uncached, sum_input_cached, sum_output,
+		       msg_count, last_model, last_provider, summary, first_log_id
+		FROM sessions WHERE session_id = ?`, sessionID).Scan(
+		&s.SessionID, &s.StartTime, &s.EndTime,
+		&s.TotalTokens, &s.TotalInputUncachedTokens, &s.TotalInputCachedTokens, &s.TotalOutputTokens,
+		&s.MessageCount, &s.Model, &s.Provider, &s.SessionSummary, &s.FirstLogID,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &s, nil
+}
+
+// sessionListContentCap 限制 slim 会话日志里单条消息文本的上限（rune 计）。
+// 客户端展示时本就截断到 95 字符，此处只保留足够余量即可。
+const sessionListContentCap = 4000
+
+// trimSessionLogForList 裁剪会话列表用不到的字段并限制大文本：去掉 raw 请求/响应
+// 与工具定义、把 prompt 收缩到最后一条 user/tool 输入消息、把响应文本按上限截断、
+// 工具调用只保留名称。会话视图只渲染每轮标量 + 末条输入 + 响应摘要，因此不丢失可见信息，
+// 同时避免长会话因每轮累积历史导致的 O(N^2) 体积爆炸。
+func trimSessionLogForList(s *UnifiedLog) {
+	s.RawRequest = ""
+	s.RawResponse = ""
+	s.Tools = nil
+
+	// Prompt：只保留最后一条 user/tool 消息（即该轮输入）。
+	lastIdx := -1
+	for i := len(s.Prompt) - 1; i >= 0; i-- {
+		if r := s.Prompt[i].Role; r == "user" || r == "tool" {
+			lastIdx = i
+			break
+		}
+	}
+	if lastIdx >= 0 {
+		m := s.Prompt[lastIdx]
+		m.Content = capStringRunes(m.Content, sessionListContentCap)
+		m.Thinking = ""
+		m.ToolCalls = nil
+		s.Prompt = []ChatMessage{m}
+	} else {
+		s.Prompt = nil
+	}
+
+	// Response：截断文本，工具调用只保留名称。
+	s.Response.Content = capStringRunes(s.Response.Content, sessionListContentCap)
+	s.Response.Thinking = capStringRunes(s.Response.Thinking, sessionListContentCap)
+	if len(s.Response.ToolCalls) > 0 {
+		tcs := make([]ToolCall, 0, len(s.Response.ToolCalls))
+		for _, tc := range s.Response.ToolCalls {
+			tcs = append(tcs, ToolCall{Name: tc.Name})
+		}
+		s.Response.ToolCalls = tcs
+	}
+}
+
+// capStringRunes 按 rune 安全截断，保证结果不超过 max 个 rune（含结尾省略号），
+// 避免切断多字节 UTF-8 序列。
+func capStringRunes(s string, max int) string {
+	if max <= 0 || len(s) <= max {
+		return s
+	}
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	if max <= 1 {
+		return "…"
+	}
+	return string(r[:max-1]) + "…"
 }
 
 
@@ -523,9 +844,7 @@ func (mgr *DBManager) GetLogDetail(id int64) (*UnifiedLog, error) {
 		       COALESCE(l1.prompt_json, ''), COALESCE(l1.response_json, ''), COALESCE(l1.tools_json, ''),
 		       COALESCE(l1.raw_request, ''), COALESCE(l1.raw_response, ''), COALESCE(l1.error_message, ''),
 		       datetime(l1.created_at, 'localtime'), COALESCE(l1.session_id, ''), l1.parent_id, COALESCE(l1.parent_tool_call_id, ''),
-		       CASE WHEN COALESCE(l1.session_id, '') != '' THEN
-		            (SELECT COUNT(*) FROM logs l2 WHERE l2.session_id = l1.session_id AND l2.id <= l1.id)
-		       ELSE 0 END as session_seq
+		       l1.session_seq
 		FROM logs l1
 		WHERE l1.id = ?
 	`
@@ -564,33 +883,9 @@ func (mgr *DBManager) GetLogDetail(id int64) (*UnifiedLog, error) {
 
 	logUnified.normalizeAnthropicTokens()
 
-	// 填充详情的 sessionSummary
+	// 填充详情的 sessionSummary：直读 sessions.summary（替代最早 3 轮 prompt 的 N+1 解析）。
 	if logUnified.SessionID != "" {
-		subRows, err := mgr.db.Query(`
-			SELECT COALESCE(prompt_json, '')
-			FROM logs
-			WHERE session_id = ?
-			ORDER BY id ASC
-			LIMIT 3
-		`, logUnified.SessionID)
-		if err == nil {
-			for subRows.Next() {
-				var promptStr string
-				if subRows.Scan(&promptStr) == nil && promptStr != "" {
-					var msgs []ChatMessage
-					if err := json.Unmarshal([]byte(promptStr), &msgs); err == nil {
-						summary := extractPromptSummary(msgs)
-						if summary != "" {
-							logUnified.SessionSummary = summary
-							if isMeaningfulSummary(summary) {
-								break
-							}
-						}
-					}
-				}
-			}
-			subRows.Close()
-		}
+		_ = mgr.db.QueryRow("SELECT COALESCE(summary,'') FROM sessions WHERE session_id = ?", logUnified.SessionID).Scan(&logUnified.SessionSummary)
 	}
 
 	// 级联查询子会话
@@ -600,9 +895,7 @@ func (mgr *DBManager) GetLogDetail(id int64) (*UnifiedLog, error) {
 		       COALESCE(l1.prompt_json, ''), COALESCE(l1.response_json, ''), COALESCE(l1.tools_json, ''),
 		       COALESCE(l1.raw_request, ''), COALESCE(l1.raw_response, ''), COALESCE(l1.error_message, ''),
 		       datetime(l1.created_at, 'localtime'), COALESCE(l1.session_id, ''), l1.parent_id, COALESCE(l1.parent_tool_call_id, ''),
-		       CASE WHEN COALESCE(l1.session_id, '') != '' THEN
-		            (SELECT COUNT(*) FROM logs l2 WHERE l2.session_id = l1.session_id AND l2.id <= l1.id)
-		       ELSE 0 END as session_seq
+		       l1.session_seq
 		FROM logs l1
 		WHERE l1.parent_id = ?
 		ORDER BY l1.id ASC
@@ -1010,122 +1303,50 @@ func (mgr *DBManager) GetSessions(page, pageSize int, keyword string) ([]Session
 	}
 	offset := (page - 1) * pageSize
 
-	// 1. 获取总数
-	countQuery := `
-		SELECT COUNT(DISTINCT CASE WHEN session_id IS NOT NULL AND session_id != '' THEN session_id ELSE 'standalone-' || id END)
-		FROM logs
-		WHERE 1=1`
+	// 关键字匹配 sessions.summary（不再 LIKE 扫 raw_request/raw_response 大字段）。
+	whereClause := ""
 	args := []any{}
 	if keyword != "" {
-		countQuery += " AND (raw_request LIKE ? OR raw_response LIKE ? OR error_message LIKE ?)"
-		likeArg := "%" + keyword + "%"
-		args = append(args, likeArg, likeArg, likeArg)
+		whereClause = " WHERE summary LIKE ?"
+		args = append(args, "%"+keyword+"%")
 	}
 
+	// 1. 总数：sessions 行数（索引扫描，替代原 COUNT(DISTINCT ...) 全表扫）。
 	var total int
-	err := mgr.db.QueryRow(countQuery, args...).Scan(&total)
-	if err != nil {
+	if err := mgr.db.QueryRow("SELECT COUNT(*) FROM sessions"+whereClause, args...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 
-	// 2. 分页获取会话信息
+	// 2. 分页：idx_sessions_last_log_id 索引扫描，替代原 GROUP BY + 排序。
 	dataQuery := fmt.Sprintf(`
-		WITH SessionGroups AS (
-			SELECT
-				CASE WHEN session_id IS NOT NULL AND session_id != '' THEN session_id ELSE 'standalone-' || id END as effective_session_id,
-				MIN(id) as first_id,
-				MAX(id) as last_id,
-				datetime(MIN(created_at), 'localtime') as start_time,
-				datetime(MAX(created_at), 'localtime') as end_time,
-				SUM(total_tokens) as sum_tokens,
-				SUM(CASE WHEN provider='anthropic' THEN input_tokens ELSE input_tokens - COALESCE(cached_tokens, 0) END) as sum_input_uncached,
-				SUM(CASE WHEN provider='anthropic' THEN COALESCE(cache_read_tokens, 0) ELSE COALESCE(cached_tokens, 0) END) as sum_input_cached,
-				SUM(output_tokens) as sum_output,
-				COUNT(*) as msg_count,
-				MAX(model) as last_model,
-				MAX(provider) as last_provider
-			FROM logs
-			WHERE 1=1 %s
-			GROUP BY effective_session_id
-		)
-		SELECT effective_session_id, first_id, last_id, start_time, end_time, sum_tokens, sum_input_uncached, sum_input_cached, sum_output, msg_count, last_model, last_provider
-		FROM SessionGroups
-		ORDER BY last_id DESC
-		LIMIT ? OFFSET ?`, func() string {
-		if keyword != "" {
-			return " AND (raw_request LIKE ? OR raw_response LIKE ? OR error_message LIKE ?)"
-		}
-		return ""
-	}())
-
+		SELECT session_id, datetime(start_time,'localtime'), datetime(end_time,'localtime'),
+		       sum_tokens, sum_input_uncached, sum_input_cached, sum_output,
+		       msg_count, last_model, last_provider, summary, first_log_id
+		FROM sessions%s
+		ORDER BY last_log_id DESC
+		LIMIT ? OFFSET ?`, whereClause)
 	dataArgs := append(args, pageSize, offset)
+
 	rows, err := mgr.db.Query(dataQuery, dataArgs...)
 	if err != nil {
 		return nil, 0, err
 	}
 	defer rows.Close()
 
-	type rawSession struct {
-		SessionMetadata
-		firstID int64
-	}
-	var raws []rawSession
+	var sessions []SessionMetadata
 	for rows.Next() {
 		var s SessionMetadata
-		var firstID, discardLastID int64
-		err := rows.Scan(
-			&s.SessionID, &firstID, &discardLastID, &s.StartTime, &s.EndTime,
+		if err := rows.Scan(
+			&s.SessionID, &s.StartTime, &s.EndTime,
 			&s.TotalTokens, &s.TotalInputUncachedTokens, &s.TotalInputCachedTokens, &s.TotalOutputTokens,
-			&s.MessageCount, &s.Model, &s.Provider,
-		)
-		if err != nil {
+			&s.MessageCount, &s.Model, &s.Provider, &s.SessionSummary, &s.FirstLogID,
+		); err != nil {
 			return nil, 0, err
 		}
-		raws = append(raws, rawSession{SessionMetadata: s, firstID: firstID})
+		sessions = append(sessions, s)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, 0, err
-	}
-	rows.Close()
-
-	// 必须在 rows 关闭后再查摘要，否则 SetMaxOpenConns(1) 会死锁
-	for i := range raws {
-		s := &raws[i]
-		if strings.HasPrefix(s.SessionID, "standalone-") {
-			var promptStr string
-			err = mgr.db.QueryRow("SELECT prompt_json FROM logs WHERE id = ?", s.firstID).Scan(&promptStr)
-			if err == nil && promptStr != "" {
-				var msgs []ChatMessage
-				if json.Unmarshal([]byte(promptStr), &msgs) == nil {
-					s.SessionSummary = extractPromptSummary(msgs)
-				}
-			}
-		} else {
-			subRows, err := mgr.db.Query("SELECT prompt_json FROM logs WHERE session_id = ? ORDER BY id ASC LIMIT 3", s.SessionID)
-			if err == nil {
-				for subRows.Next() {
-					var promptStr string
-					if subRows.Scan(&promptStr) == nil && promptStr != "" {
-						var msgs []ChatMessage
-						if err := json.Unmarshal([]byte(promptStr), &msgs); err == nil {
-							summary := extractPromptSummary(msgs)
-							if summary != "" {
-								s.SessionSummary = summary
-								if isMeaningfulSummary(summary) {
-									break
-								}
-							}
-						}
-					}
-				}
-				subRows.Close()
-			}
-		}
-	}
-
-	sessions := make([]SessionMetadata, len(raws))
-	for i, r := range raws {
-		sessions[i] = r.SessionMetadata
 	}
 	return sessions, total, nil
 }
@@ -1137,16 +1358,50 @@ func (mgr *DBManager) DeleteLog(id int64) error {
 	}
 	defer tx.Rollback()
 
+	// 0. 先读该 log 的 session_id（删除后无法再查）；不存在则幂等返回。
+	var sessionID string
+	switch e := tx.QueryRow("SELECT COALESCE(session_id,'') FROM logs WHERE id = ?", id).Scan(&sessionID); e {
+	case nil:
+	case sql.ErrNoRows:
+		return nil
+	default:
+		return e
+	}
+
 	// 1. 删除 log_handles 中关联的记录
-	_, err = tx.Exec("DELETE FROM log_handles WHERE log_id = ?", id)
-	if err != nil {
+	if _, err = tx.Exec("DELETE FROM log_handles WHERE log_id = ?", id); err != nil {
 		return fmt.Errorf("delete log handles: %w", err)
 	}
 
 	// 2. 删除 logs 表中的记录
-	_, err = tx.Exec("DELETE FROM logs WHERE id = ?", id)
-	if err != nil {
+	if _, err = tx.Exec("DELETE FROM logs WHERE id = ?", id); err != nil {
 		return fmt.Errorf("delete log: %w", err)
+	}
+
+	// 3. 维护 sessions 实体（ADR-0001）：lifetime 字段（msg_count/sum_*/summary）不动，
+	//    只重算结构字段（first/last/times/last_model/provider）；该会话 0 残留则销毁实体。
+	if sessionID != "" {
+		var remaining int
+		if err = tx.QueryRow("SELECT COUNT(*) FROM logs WHERE session_id = ?", sessionID).Scan(&remaining); err != nil {
+			return err
+		}
+		if remaining == 0 {
+			if _, err = tx.Exec("DELETE FROM sessions WHERE session_id = ?", sessionID); err != nil {
+				return fmt.Errorf("delete empty session: %w", err)
+			}
+		} else {
+			if _, err = tx.Exec(`
+				UPDATE sessions SET
+					first_log_id  = (SELECT MIN(id) FROM logs WHERE session_id = sessions.session_id),
+					last_log_id   = (SELECT MAX(id) FROM logs WHERE session_id = sessions.session_id),
+					start_time    = (SELECT MIN(created_at) FROM logs WHERE session_id = sessions.session_id),
+					end_time      = (SELECT MAX(created_at) FROM logs WHERE session_id = sessions.session_id),
+					last_model    = (SELECT model FROM logs WHERE id = (SELECT MAX(id) FROM logs WHERE session_id = sessions.session_id)),
+					last_provider = (SELECT provider FROM logs WHERE id = (SELECT MAX(id) FROM logs WHERE session_id = sessions.session_id))
+				WHERE session_id = ?`, sessionID); err != nil {
+				return fmt.Errorf("recompute session structural fields: %w", err)
+			}
+		}
 	}
 
 	return tx.Commit()
@@ -1176,6 +1431,11 @@ func (mgr *DBManager) DeleteSessionLogs(sessionID string) error {
 	_, err = tx.Exec("DELETE FROM logs WHERE session_id = ?", sessionID)
 	if err != nil {
 		return fmt.Errorf("delete session logs: %w", err)
+	}
+
+	// 3. 销毁 sessions 实体（ADR-0001：整组删尽，lifetime 账随实体消失）
+	if _, err = tx.Exec("DELETE FROM sessions WHERE session_id = ?", sessionID); err != nil {
+		return fmt.Errorf("delete session: %w", err)
 	}
 
 	return tx.Commit()

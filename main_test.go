@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1418,7 +1419,7 @@ func TestGetSessionLogs(t *testing.T) {
 		Response:   ChatMessage{Role: "assistant", Content: "Hi 3"},
 	})
 
-	logs, err := dbMgr.GetSessionLogs(sessionID)
+	logs, _, err := dbMgr.GetSessionLogs(sessionID, false, 1, 1000)
 	if err != nil {
 		t.Fatalf("failed to get session logs: %v", err)
 	}
@@ -1427,6 +1428,138 @@ func TestGetSessionLogs(t *testing.T) {
 	}
 	if logs[0].Response.Content != "Hi 1" || logs[1].Response.Content != "Hi 2" {
 		t.Errorf("unexpected logs order or contents: %+v", logs)
+	}
+}
+
+// TestGetSessionLogsSlimPayload 锁定修复：长会话每轮携带累积历史，默认 slim 模式必须只
+// 返回轻量摘要（去掉 raw 请求/响应/工具定义、prompt 收缩到末条 user/tool 消息、响应文本截断、
+// 工具调用只留名称），避免 payload 呈 O(N^2) 爆炸撑爆浏览器渲染进程；?full=1 仍返回完整数据。
+func TestGetSessionLogsSlimPayload(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "llm_tracer_slim_*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	dbMgr, err := InitDB(filepath.Join(tempDir, "slim.db"))
+	if err != nil {
+		t.Fatalf("failed to init db: %v", err)
+	}
+	defer dbMgr.Close()
+
+	sessionID := "big-session"
+	const turns = 40
+	bigText := strings.Repeat("x", 20_000) // 20KB 单条内容
+
+	for i := 0; i < turns; i++ {
+		// 模拟累积历史：第 i 轮 prompt 含多条历史消息（每条都很大）+ 末尾 assistant + 新 user 输入
+		prompt := make([]ChatMessage, 0, i+3)
+		for j := 0; j <= i; j++ {
+			prompt = append(prompt, ChatMessage{Role: "user", Content: bigText})
+		}
+		prompt = append(prompt, ChatMessage{Role: "assistant", Content: bigText})
+		prompt = append(prompt, ChatMessage{Role: "user", Content: "latest input " + bigText})
+
+		if _, err := dbMgr.InsertLog(&UnifiedLog{
+			Provider:   "openai",
+			Model:      "gpt-4",
+			Path:       "/v1/chat/completions",
+			StatusCode: 200,
+			SessionID:  sessionID,
+			Prompt:     prompt,
+			Response: ChatMessage{
+				Role:     "assistant",
+				Content:  bigText,
+				Thinking: bigText,
+				ToolCalls: []ToolCall{
+					{Name: "search", Arguments: bigText},
+					{Name: "read", Arguments: bigText},
+				},
+			},
+			RawRequest:  bigText + bigText,
+			RawResponse: bigText,
+			Tools: []ToolDef{
+				{Name: "search", Description: bigText, Parameters: bigText},
+			},
+		}); err != nil {
+			t.Fatalf("insert log %d: %v", i, err)
+		}
+	}
+
+	// slim（默认）
+	slimLogs, _, err := dbMgr.GetSessionLogs(sessionID, false, 1, 1000)
+	if err != nil {
+		t.Fatalf("GetSessionLogs slim: %v", err)
+	}
+	if len(slimLogs) != turns {
+		t.Fatalf("expected %d slim logs, got %d", turns, len(slimLogs))
+	}
+
+	slimBytes, err := json.Marshal(slimLogs)
+	if err != nil {
+		t.Fatalf("marshal slim: %v", err)
+	}
+	// 全量理论体积：prompt O(N^2)×20KB ≈ 16MB + raw 40×40KB + tools 40×40KB ≫ 17MB。
+	// slim 必须远小于 2MB，否则长会话会撑爆浏览器。
+	if len(slimBytes) > 2_000_000 {
+		t.Fatalf("slim payload too large: %d bytes (want < 2MB)", len(slimBytes))
+	}
+	t.Logf("slim payload: %d bytes for %d turns (full would be ~17MB+)", len(slimBytes), turns)
+
+	for i, l := range slimLogs {
+		if l.RawRequest != "" {
+			t.Errorf("turn %d: RawRequest not stripped", i)
+		}
+		if l.RawResponse != "" {
+			t.Errorf("turn %d: RawResponse not stripped", i)
+		}
+		if l.Tools != nil {
+			t.Errorf("turn %d: Tools not stripped", i)
+		}
+		if len(l.Prompt) > 1 {
+			t.Errorf("turn %d: Prompt not trimmed, len=%d", i, len(l.Prompt))
+		}
+		if len(l.Prompt) == 1 {
+			if l.Prompt[0].Role != "user" {
+				t.Errorf("turn %d: trimmed prompt role=%s want user", i, l.Prompt[0].Role)
+			}
+			if len([]rune(l.Prompt[0].Content)) > sessionListContentCap {
+				t.Errorf("turn %d: prompt content not capped: %d runes", i, len([]rune(l.Prompt[0].Content)))
+			}
+		}
+		if len([]rune(l.Response.Content)) > sessionListContentCap {
+			t.Errorf("turn %d: response content not capped", i)
+		}
+		if len([]rune(l.Response.Thinking)) > sessionListContentCap {
+			t.Errorf("turn %d: response thinking not capped", i)
+		}
+		for _, tc := range l.Response.ToolCalls {
+			if tc.Arguments != "" {
+				t.Errorf("turn %d: tool call arguments not stripped", i)
+			}
+		}
+	}
+
+	// full：应保留完整数据
+	fullLogs, _, err := dbMgr.GetSessionLogs(sessionID, true, 1, 1000)
+	if err != nil {
+		t.Fatalf("GetSessionLogs full: %v", err)
+	}
+	if len(fullLogs) != turns {
+		t.Fatalf("expected %d full logs, got %d", turns, len(fullLogs))
+	}
+	last := fullLogs[len(fullLogs)-1]
+	if len(last.Prompt) <= 1 {
+		t.Errorf("full mode: last turn prompt should carry cumulative history, got len=%d", len(last.Prompt))
+	}
+	if last.RawRequest == "" {
+		t.Errorf("full mode: RawRequest should be populated")
+	}
+	if len(last.Tools) == 0 {
+		t.Errorf("full mode: Tools should be populated")
+	}
+	if len(last.Response.ToolCalls) == 0 || last.Response.ToolCalls[0].Arguments == "" {
+		t.Errorf("full mode: tool call arguments should be populated")
 	}
 }
 
@@ -1542,7 +1675,7 @@ func TestDeleteSessionLogs(t *testing.T) {
 	})
 
 	// 确认 session 1 有 2 条 logs
-	logs, _ := dbMgr.GetSessionLogs(sessionID1)
+	logs, _, _ := dbMgr.GetSessionLogs(sessionID1, false, 1, 1000)
 	if len(logs) != 2 {
 		t.Fatalf("expected 2 logs for session 1, got %d", len(logs))
 	}
@@ -1561,7 +1694,7 @@ func TestDeleteSessionLogs(t *testing.T) {
 	}
 
 	// 确认 session 1 logs 已经没有了
-	logs, _ = dbMgr.GetSessionLogs(sessionID1)
+	logs, _, _ = dbMgr.GetSessionLogs(sessionID1, false, 1, 1000)
 	if len(logs) != 0 {
 		t.Fatalf("expected 0 logs for session 1, got %d", len(logs))
 	}
@@ -1573,7 +1706,7 @@ func TestDeleteSessionLogs(t *testing.T) {
 	}
 
 	// 确认 session 2 logs 和 handles 仍然存在
-	logs2, _ := dbMgr.GetSessionLogs(sessionID2)
+	logs2, _, _ := dbMgr.GetSessionLogs(sessionID2, false, 1, 1000)
 	if len(logs2) != 1 {
 		t.Fatalf("expected 1 log for session 2, got %d", len(logs2))
 	}
@@ -1650,5 +1783,223 @@ func TestParseThinkingAndReasoningRequest(t *testing.T) {
 	}
 	if openaiAssistantMsg.Content != "1+1 equals 2" {
 		t.Errorf("expected content to be '1+1 equals 2', got %q", openaiAssistantMsg.Content)
+	}
+}
+
+// findSession 在 GetSessions 结果里找指定 sessionID。
+func findSession(t *testing.T, sessions []SessionMetadata, sid string) SessionMetadata {
+	t.Helper()
+	for _, s := range sessions {
+		if s.SessionID == sid {
+			return s
+		}
+	}
+	t.Fatalf("session %q not found among %d sessions", sid, len(sessions))
+	return SessionMetadata{}
+}
+
+func mustGetSessions(t *testing.T, dbMgr *DBManager) []SessionMetadata {
+	t.Helper()
+	s, _, err := dbMgr.GetSessions(1, 20, "")
+	if err != nil {
+		t.Fatalf("GetSessions: %v", err)
+	}
+	return s
+}
+
+// TestSessionAggregates 验证 sessions 表的聚合（msg_count/sum_tokens/last_model/firstLogId）。
+func TestSessionAggregates(t *testing.T) {
+	tempDir := t.TempDir()
+	dbMgr, err := InitDB(filepath.Join(tempDir, "agg.db"))
+	if err != nil {
+		t.Fatalf("init db: %v", err)
+	}
+	defer dbMgr.Close()
+
+	sid := "sess-agg"
+	inserts := []UnifiedLog{
+		{Provider: "openai", Model: "gpt-4", Path: "/v1/chat/completions", StatusCode: 200, SessionID: sid, InputTokens: 10, OutputTokens: 5, TotalTokens: 15, Prompt: []ChatMessage{{Role: "user", Content: "你好"}}, Response: ChatMessage{Role: "assistant", Content: "hi"}},
+		{Provider: "openai", Model: "gpt-4", Path: "/v1/chat/completions", StatusCode: 200, SessionID: sid, InputTokens: 20, OutputTokens: 10, TotalTokens: 30, Prompt: []ChatMessage{{Role: "user", Content: "帮我重构代码"}}, Response: ChatMessage{Role: "assistant", Content: "ok"}},
+		{Provider: "openai", Model: "gpt-4o", Path: "/v1/chat/completions", StatusCode: 200, SessionID: sid, InputTokens: 30, OutputTokens: 15, TotalTokens: 45, Prompt: []ChatMessage{{Role: "user", Content: "再改一下"}}, Response: ChatMessage{Role: "assistant", Content: "done"}},
+	}
+	for i := range inserts {
+		if _, err := dbMgr.InsertLog(&inserts[i]); err != nil {
+			t.Fatalf("insert %d: %v", i, err)
+		}
+	}
+
+	sessions, total, err := dbMgr.GetSessions(1, 20, "")
+	if err != nil {
+		t.Fatalf("GetSessions: %v", err)
+	}
+	if total != 1 {
+		t.Fatalf("expected total=1, got %d", total)
+	}
+	s := findSession(t, sessions, sid)
+	if s.MessageCount != 3 {
+		t.Errorf("msg_count: want 3, got %d", s.MessageCount)
+	}
+	if s.TotalTokens != 90 {
+		t.Errorf("sum_tokens: want 90, got %d", s.TotalTokens)
+	}
+	if s.TotalOutputTokens != 30 {
+		t.Errorf("sum_output: want 30, got %d", s.TotalOutputTokens)
+	}
+	if s.Model != "gpt-4o" {
+		t.Errorf("last_model (latest log): want gpt-4o, got %s", s.Model)
+	}
+	if s.FirstLogID == 0 {
+		t.Errorf("firstLogId should be set")
+	}
+}
+
+// TestSessionSummaryLifetime 摘要 = lifetime 首条 meaningful，一次设定后稳定。
+func TestSessionSummaryLifetime(t *testing.T) {
+	tempDir := t.TempDir()
+	dbMgr, _ := InitDB(filepath.Join(tempDir, "sum.db"))
+	defer dbMgr.Close()
+
+	sid := "sess-sum"
+	_, _ = dbMgr.InsertLog(&UnifiedLog{Provider: "openai", Model: "gpt-4", StatusCode: 200, SessionID: sid, Prompt: []ChatMessage{{Role: "user", Content: "你好"}}, Response: ChatMessage{Role: "assistant", Content: "hi"}})
+	_, _ = dbMgr.InsertLog(&UnifiedLog{Provider: "openai", Model: "gpt-4", StatusCode: 200, SessionID: sid, Prompt: []ChatMessage{{Role: "user", Content: "帮我重构代码"}}, Response: ChatMessage{Role: "assistant", Content: "ok"}})
+	if got := findSession(t, mustGetSessions(t, dbMgr), sid).SessionSummary; got != "帮我重构代码" {
+		t.Errorf("summary after turn2: want '帮我重构代码', got %q", got)
+	}
+	_, _ = dbMgr.InsertLog(&UnifiedLog{Provider: "openai", Model: "gpt-4", StatusCode: 200, SessionID: sid, Prompt: []ChatMessage{{Role: "user", Content: "换个话题说说天气"}}, Response: ChatMessage{Role: "assistant", Content: "ok"}})
+	if got := findSession(t, mustGetSessions(t, dbMgr), sid).SessionSummary; got != "帮我重构代码" {
+		t.Errorf("summary should be stable: want '帮我重构代码', got %q", got)
+	}
+}
+
+// TestDeleteLogPreservesLifetimeStats 删中间一条：lifetime 不变、结构重算、摘要反范式存活、session_seq 留缺口。
+func TestDeleteLogPreservesLifetimeStats(t *testing.T) {
+	tempDir := t.TempDir()
+	dbMgr, _ := InitDB(filepath.Join(tempDir, "del.db"))
+	defer dbMgr.Close()
+
+	sid := "sess-del"
+	_, _ = dbMgr.InsertLog(&UnifiedLog{Provider: "openai", Model: "gpt-4", StatusCode: 200, SessionID: sid, InputTokens: 10, OutputTokens: 5, TotalTokens: 15, Prompt: []ChatMessage{{Role: "user", Content: "你好"}}, Response: ChatMessage{Role: "assistant", Content: "hi"}})
+	id2, _ := dbMgr.InsertLog(&UnifiedLog{Provider: "openai", Model: "gpt-4", StatusCode: 200, SessionID: sid, InputTokens: 20, OutputTokens: 10, TotalTokens: 30, Prompt: []ChatMessage{{Role: "user", Content: "帮我重构代码"}}, Response: ChatMessage{Role: "assistant", Content: "ok"}})
+	_, _ = dbMgr.InsertLog(&UnifiedLog{Provider: "openai", Model: "gpt-4o", StatusCode: 200, SessionID: sid, InputTokens: 30, OutputTokens: 15, TotalTokens: 45, Prompt: []ChatMessage{{Role: "user", Content: "再改一下"}}, Response: ChatMessage{Role: "assistant", Content: "done"}})
+
+	if err := dbMgr.DeleteLog(id2); err != nil {
+		t.Fatalf("DeleteLog: %v", err)
+	}
+
+	se := findSession(t, mustGetSessions(t, dbMgr), sid)
+	if se.MessageCount != 3 {
+		t.Errorf("lifetime msg_count: want 3, got %d", se.MessageCount)
+	}
+	if se.TotalTokens != 90 {
+		t.Errorf("lifetime sum_tokens: want 90, got %d", se.TotalTokens)
+	}
+	if se.SessionSummary != "帮我重构代码" {
+		t.Errorf("summary should survive delete (denormalized): got %q", se.SessionSummary)
+	}
+	if se.Model != "gpt-4o" {
+		t.Errorf("last_model should recompute to gpt-4o: got %s", se.Model)
+	}
+
+	logs, _, err := dbMgr.GetSessionLogs(sid, false, 1, 1000)
+	if err != nil {
+		t.Fatalf("GetSessionLogs: %v", err)
+	}
+	var seqs []int
+	for _, l := range logs {
+		seqs = append(seqs, l.SessionSeq)
+	}
+	if len(seqs) != 2 || seqs[0] != 1 || seqs[1] != 3 {
+		t.Errorf("session_seq should be [1,3] with gap at 2, got %v", seqs)
+	}
+	var maxSeq, mc int
+	_ = dbMgr.db.QueryRow("SELECT MAX(session_seq) FROM logs WHERE session_id=?", sid).Scan(&maxSeq)
+	_ = dbMgr.db.QueryRow("SELECT msg_count FROM sessions WHERE session_id=?", sid).Scan(&mc)
+	if maxSeq != mc {
+		t.Errorf("with last log present: max(session_seq)=%d should == msg_count=%d", maxSeq, mc)
+	}
+}
+
+// TestDeleteAllLogsRemovesSession 整组删尽 -> sessions 行销毁。
+func TestDeleteAllLogsRemovesSession(t *testing.T) {
+	tempDir := t.TempDir()
+	dbMgr, _ := InitDB(filepath.Join(tempDir, "alldel.db"))
+	defer dbMgr.Close()
+
+	sid := "sess-all"
+	id1, _ := dbMgr.InsertLog(&UnifiedLog{Provider: "openai", Model: "gpt-4", StatusCode: 200, SessionID: sid, Prompt: []ChatMessage{{Role: "user", Content: "hi"}}, Response: ChatMessage{Role: "assistant", Content: "ok"}})
+	id2, _ := dbMgr.InsertLog(&UnifiedLog{Provider: "openai", Model: "gpt-4", StatusCode: 200, SessionID: sid, Prompt: []ChatMessage{{Role: "user", Content: "again"}}, Response: ChatMessage{Role: "assistant", Content: "ok"}})
+
+	if _, total, _ := dbMgr.GetSessions(1, 20, ""); total != 1 {
+		t.Fatalf("expected 1 session, got %d", total)
+	}
+	if err := dbMgr.DeleteLog(id1); err != nil {
+		t.Fatal(err)
+	}
+	if err := dbMgr.DeleteLog(id2); err != nil {
+		t.Fatal(err)
+	}
+	if _, total, _ := dbMgr.GetSessions(1, 20, ""); total != 0 {
+		t.Errorf("session should be gone after all logs deleted, got total=%d", total)
+	}
+}
+
+// TestStandaloneSessionKey 空 session_id 写入时合成 'standalone-<id>' 并回写 logs.session_id。
+func TestStandaloneSessionKey(t *testing.T) {
+	tempDir := t.TempDir()
+	dbMgr, _ := InitDB(filepath.Join(tempDir, "standalone.db"))
+	defer dbMgr.Close()
+
+	id, _ := dbMgr.InsertLog(&UnifiedLog{Provider: "openai", Model: "gpt-4", StatusCode: 200, SessionID: "", Prompt: []ChatMessage{{Role: "user", Content: "standalone query"}}, Response: ChatMessage{Role: "assistant", Content: "ok"}})
+
+	var sid string
+	_ = dbMgr.db.QueryRow("SELECT session_id FROM logs WHERE id=?", id).Scan(&sid)
+	want := "standalone-" + strconv.FormatInt(id, 10)
+	if sid != want {
+		t.Errorf("logs.session_id: want %q, got %q", want, sid)
+	}
+	sessions, _, _ := dbMgr.GetSessions(1, 20, "")
+	findSession(t, sessions, sid) // sessions 键应与 logs.session_id 一致
+}
+
+// TestSessionKeywordSearch 会话列表关键字匹配 sessions.summary。
+func TestSessionKeywordSearch(t *testing.T) {
+	tempDir := t.TempDir()
+	dbMgr, _ := InitDB(filepath.Join(tempDir, "kw.db"))
+	defer dbMgr.Close()
+
+	_, _ = dbMgr.InsertLog(&UnifiedLog{Provider: "openai", Model: "gpt-4", StatusCode: 200, SessionID: "sess-a", Prompt: []ChatMessage{{Role: "user", Content: "帮我重构认证模块"}}, Response: ChatMessage{Role: "assistant", Content: "ok"}})
+	_, _ = dbMgr.InsertLog(&UnifiedLog{Provider: "openai", Model: "gpt-4", StatusCode: 200, SessionID: "sess-b", Prompt: []ChatMessage{{Role: "user", Content: "讲个笑话"}}, Response: ChatMessage{Role: "assistant", Content: "ok"}})
+
+	s, total, _ := dbMgr.GetSessions(1, 20, "重构")
+	if total != 1 || len(s) != 1 || s[0].SessionID != "sess-a" {
+		t.Errorf("keyword '重构' should match only sess-a, got total=%d len=%d", total, len(s))
+	}
+}
+
+// TestSessionBackfill sessions 清空后从 logs 自愈重建。
+func TestSessionBackfill(t *testing.T) {
+	tempDir := t.TempDir()
+	dbMgr, _ := InitDB(filepath.Join(tempDir, "bf.db"))
+	defer dbMgr.Close()
+
+	sid := "sess-bf"
+	_, _ = dbMgr.InsertLog(&UnifiedLog{Provider: "openai", Model: "gpt-4", StatusCode: 200, SessionID: sid, InputTokens: 10, OutputTokens: 5, TotalTokens: 15, Prompt: []ChatMessage{{Role: "user", Content: "你好"}}, Response: ChatMessage{Role: "assistant", Content: "hi"}})
+	_, _ = dbMgr.InsertLog(&UnifiedLog{Provider: "openai", Model: "gpt-4", StatusCode: 200, SessionID: sid, InputTokens: 20, OutputTokens: 10, TotalTokens: 30, Prompt: []ChatMessage{{Role: "user", Content: "帮我重构代码"}}, Response: ChatMessage{Role: "assistant", Content: "ok"}})
+
+	b := findSession(t, mustGetSessions(t, dbMgr), sid)
+	if b.MessageCount != 2 || b.TotalTokens != 45 || b.SessionSummary != "帮我重构代码" {
+		t.Fatalf("pre-backfill state wrong: %+v", b)
+	}
+
+	if _, err := dbMgr.db.Exec("DELETE FROM sessions"); err != nil {
+		t.Fatalf("clear sessions: %v", err)
+	}
+	if err := dbMgr.backfillSessions(); err != nil {
+		t.Fatalf("backfill: %v", err)
+	}
+
+	a := findSession(t, mustGetSessions(t, dbMgr), sid)
+	if a.MessageCount != 2 || a.TotalTokens != 45 || a.SessionSummary != "帮我重构代码" {
+		t.Errorf("post-backfill state wrong: %+v", a)
 	}
 }

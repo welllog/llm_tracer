@@ -536,6 +536,25 @@ func onExit() {
 	}
 }
 
+// statusRecorder 包装 ResponseWriter 以捕获状态码与写出字节数，
+// 供控制台 API 访问日志记录每个请求的体积与耗时。
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+	bytes  int
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	r.status = code
+	r.ResponseWriter.WriteHeader(code)
+}
+
+func (r *statusRecorder) Write(b []byte) (int, error) {
+	n, err := r.ResponseWriter.Write(b)
+	r.bytes += n
+	return n, err
+}
+
 func main() {
 	// 初始化系统运行日志重定向
 	appDir := getAppDir()
@@ -660,7 +679,10 @@ func main() {
 		}
 
 		if strings.HasPrefix(r.URL.Path, "/api/") {
-			consoleMux.ServeHTTP(w, r)
+			start := time.Now()
+			rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+			consoleMux.ServeHTTP(rec, r)
+			log.Printf("[api] %s %s %d %dB %s", r.Method, r.URL.Path, rec.status, rec.bytes, time.Since(start).Round(time.Millisecond))
 		} else {
 			staticHandler.ServeHTTP(w, r)
 		}
@@ -763,11 +785,16 @@ func (s *ProxyServer) handleGetLogs(w http.ResponseWriter, r *http.Request) {
 		excludeBranches = ebStr == "true"
 	}
 
+	start := time.Now()
 	summaries, total, err := s.db.GetLogs(page, pageSize, provider, model, keyword, statusFilter, excludeBranches)
+	queryDur := time.Since(start).Round(time.Millisecond)
 	if err != nil {
+		log.Printf("[logs] page=%d size=%d error=%v query=%s", page, pageSize, err, queryDur)
 		http.Error(w, fmt.Errorf("query logs: %w", err).Error(), http.StatusInternalServerError)
 		return
 	}
+
+	log.Printf("[logs] page=%d size=%d total=%d query=%s", page, pageSize, total, queryDur)
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
@@ -785,14 +812,39 @@ func (s *ProxyServer) handleGetSessionLogs(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	logs, err := s.db.GetSessionLogs(sessionID)
+	// ?full=1 保留原始全量字段（调试用）；默认 slim，只返回会话列表视图需要的轻量摘要，
+	// 避免长会话因每轮累积历史导致 payload 呈 O(N^2) 爆炸撑爆浏览器。
+	full := func() bool {
+		f := r.URL.Query().Get("full")
+		return f == "1" || f == "true"
+	}()
+
+	// 分页：会话时间轴按页加载，避免一次拉全部轮次（S1）。
+	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+	pageSize, _ := strconv.Atoi(r.URL.Query().Get("pageSize"))
+
+	start := time.Now()
+	logs, total, err := s.db.GetSessionLogs(sessionID, full, page, pageSize)
+	queryDur := time.Since(start).Round(time.Millisecond)
 	if err != nil {
+		log.Printf("[sess] sid=%s full=%v error=%v query=%s", sessionID, full, err, queryDur)
 		http.Error(w, fmt.Sprintf("get session logs: %v", err), http.StatusInternalServerError)
 		return
 	}
 
+	// 会话级总额（lifetime，来自 sessions 表）随首响应返回，前端不再 reduce 累加。
+	session, _ := s.db.GetSessionByID(sessionID)
+
+	log.Printf("[sess] sid=%s full=%v turns=%d/%d query=%s", sessionID, full, len(logs), total, queryDur)
+
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(logs)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"list":     logs,
+		"total":    total,
+		"page":     page,
+		"pageSize": pageSize,
+		"session":  session,
+	})
 }
 
 func (s *ProxyServer) handleGetLogDetail(w http.ResponseWriter, r *http.Request) {
@@ -803,22 +855,32 @@ func (s *ProxyServer) handleGetLogDetail(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	start := time.Now()
 	detail, err := s.db.GetLogDetail(id)
+	queryDur := time.Since(start).Round(time.Millisecond)
 	if err != nil {
+		log.Printf("[log] id=%d error=%v query=%s", id, err, queryDur)
 		http.Error(w, fmt.Sprintf("get log detail: %v", err), http.StatusInternalServerError)
 		return
 	}
+
+	log.Printf("[log] id=%d query=%s", id, queryDur)
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(detail)
 }
 
 func (s *ProxyServer) handleGetStats(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
 	stats, err := s.db.GetStats()
+	queryDur := time.Since(start).Round(time.Millisecond)
 	if err != nil {
+		log.Printf("[stats] error=%v query=%s", err, queryDur)
 		http.Error(w, fmt.Sprintf("get stats: %v", err), http.StatusInternalServerError)
 		return
 	}
+
+	log.Printf("[stats] query=%s", queryDur)
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(stats)
@@ -877,11 +939,16 @@ func (s *ProxyServer) handleGetSessions(w http.ResponseWriter, r *http.Request) 
 	pageSize, _ := strconv.Atoi(q.Get("pageSize"))
 	keyword := q.Get("keyword")
 
+	start := time.Now()
 	sessions, total, err := s.db.GetSessions(page, pageSize, keyword)
+	queryDur := time.Since(start).Round(time.Millisecond)
 	if err != nil {
+		log.Printf("[sessions] page=%d size=%d error=%v query=%s", page, pageSize, err, queryDur)
 		http.Error(w, fmt.Sprintf("query sessions: %v", err), http.StatusInternalServerError)
 		return
 	}
+
+	log.Printf("[sessions] page=%d size=%d total=%d query=%s", page, pageSize, total, queryDur)
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
@@ -1320,6 +1387,11 @@ func (s *ProxyServer) proxyAPI(w http.ResponseWriter, r *http.Request, provider,
 
 	// 异步写入数据库，避免写事务阻塞代理请求
 	s.enqueueLog(logRecord)
+
+	log.Printf("[px] %s %s model=%s sid=%s status=%d reqB=%d respB=%d dur=%s tok=in:%d/out:%d",
+		resolvedProvider, pathSuffix, model, sessionID, upstreamResp.StatusCode,
+		len(reqBodyToForward), rawResponseBuffer.Len(), duration.Round(time.Millisecond),
+		finalUsage.PromptTokens, finalUsage.CompletionTokens)
 }
 
 func (s *ProxyServer) logErrorExchange(provider, model, path string, reqBody []byte, err error, duration time.Duration, sessionID string, parentID *int64, parentToolCallID, clientFingerprint string) {
