@@ -348,6 +348,18 @@ function formatTokenCount(n) {
   return `${n}`;
 }
 
+// 请求时间展示：始终含日期+时间（MM-DD HH:MM:SS），跨年补全年份；完整值放 title。
+function formatLogDateTime(createdAt) {
+  if (!createdAt) return "";
+  const [datePart, timePart] = createdAt.split(" ");
+  if (!datePart) return createdAt;
+  const year = new Date().getFullYear();
+  const shortDate = datePart.startsWith(`${year}-`)
+    ? datePart.slice(5)
+    : datePart;
+  return timePart ? `${shortDate} ${timePart}` : shortDate;
+}
+
 // ==========================================
 // 日志详情组件：modal 与 inline 共用同一份渲染
 // ==========================================
@@ -536,11 +548,14 @@ function LogDetail({ log, isLoading, sessionContext, onOpenSubLog, onEnsureLoade
               {log.provider}
             </span>
           </div>
-          <span className="text-[10px] text-slate-500 font-mono truncate">
+          <span
+            className="text-[10px] text-slate-500 font-mono truncate"
+            title={log.createdAt || ""}
+          >
             {log.sessionId
               ? `会话 ${shortSessionId(log.sessionId)} #${log.sessionSeq} · ID ${log.id}`
               : `ID: ${log.id}`}{" "}
-            • Path: {log.path}
+            • {log.createdAt} • Path: {log.path}
           </span>
         </div>
 
@@ -618,7 +633,9 @@ function LogDetail({ log, isLoading, sessionContext, onOpenSubLog, onEnsureLoade
           }`}
         >
           请求消息 (
-          {log.prompt ? log.prompt.filter((p) => p.role !== "system").length : 0}
+          {log.prompt
+            ? log.prompt.filter((p) => p.role !== "system").length
+            : 0}
           )
         </button>
         {showSessionTab && (
@@ -689,9 +706,7 @@ function LogDetail({ log, isLoading, sessionContext, onOpenSubLog, onEnsureLoade
                   style={{ flex: 1 }}
                 />
                 <div className="absolute inset-0 flex justify-end items-center pr-4 text-[9px] font-bold text-white uppercase tracking-wider drop-shadow-md">
-                  <span>
-                    传输流 • {(log.durationMs / 1000).toFixed(2)}s
-                  </span>
+                  <span>传输流 • {(log.durationMs / 1000).toFixed(2)}s</span>
                 </div>
               </div>
 
@@ -904,17 +919,13 @@ function LogDetail({ log, isLoading, sessionContext, onOpenSubLog, onEnsureLoade
                               className="p-3 bg-slate-950/40 border border-slate-900 rounded-xl text-xs text-slate-300"
                             >
                               <div>
-                                <span className="text-slate-500">
-                                  Method:
-                                </span>{" "}
+                                <span className="text-slate-500">Method:</span>{" "}
                                 <span className="text-orange-400 font-semibold">
                                   {tc.name}
                                 </span>
                               </div>
                               <div className="mt-1">
-                                <span className="text-slate-500">
-                                  Args:
-                                </span>{" "}
+                                <span className="text-slate-500">Args:</span>{" "}
                                 <span className="text-emerald-400/90">
                                   {tc.arguments}
                                 </span>
@@ -939,8 +950,8 @@ function LogDetail({ log, isLoading, sessionContext, onOpenSubLog, onEnsureLoade
                 <span className="font-mono text-cyan-400">
                   ({sessionTurnCount} 轮对话 • 未缓存输入{" "}
                   {totalSessionUncachedInputTokens} / 缓存{" "}
-                  {totalSessionCachedTokens} / 输出{" "}
-                  {totalSessionOutputTokens} / 共 {totalSessionTokens} Tokens)
+                  {totalSessionCachedTokens} / 输出 {totalSessionOutputTokens} /
+                  共 {totalSessionTokens} Tokens)
                 </span>
               </div>
               <button
@@ -1100,7 +1111,7 @@ function LogDetail({ log, isLoading, sessionContext, onOpenSubLog, onEnsureLoade
                         </div>
                         <div className="flex items-center gap-2 text-[9px] font-mono text-slate-400">
                           <span title={sLog.createdAt || ""}>
-                            {sLog.createdAt ? sLog.createdAt.split(" ")[1] : ""}
+                            {formatLogDateTime(sLog.createdAt)}
                           </span>
                           <span className="text-amber-400/80">
                             {(sLog.durationMs / 1000).toFixed(2)}s
@@ -1110,7 +1121,10 @@ function LogDetail({ log, isLoading, sessionContext, onOpenSubLog, onEnsureLoade
                             className="text-orange-400/80"
                             title={`未缓存输入 Token: ${sLog.inputTokens - sLog.cachedTokens}`}
                           >
-                            未缓 {formatTokenCount(sLog.inputTokens - sLog.cachedTokens)}
+                            未缓{" "}
+                            {formatTokenCount(
+                              sLog.inputTokens - sLog.cachedTokens,
+                            )}
                           </span>
                           <span
                             className="text-cyan-400/80"
@@ -1222,102 +1236,97 @@ function LogDetail({ log, isLoading, sessionContext, onOpenSubLog, onEnsureLoade
         )}
 
         {/* 5. 已定义工具 (Tools) */}
-        {activeTab === "tools" &&
-          log.tools &&
-          log.tools.length > 0 && (
-            <div className="flex flex-col lg:flex-row gap-5 flex-1 min-h-0 h-full overflow-hidden">
-              <div className="w-full lg:w-[240px] flex flex-col gap-3 shrink-0 bg-slate-950/20 border border-slate-900/40 p-3.5 rounded-2xl min-h-0 overflow-y-auto">
-                <div className="relative flex items-center">
-                  <span className="absolute left-3.5 text-slate-500">
-                    <IconSearch />
-                  </span>
-                  <input
-                    type="text"
-                    placeholder="搜索工具名..."
-                    value={toolSearchQuery}
-                    onChange={(e) => {
-                      setToolSearchQuery(e.target.value);
-                      setSelectedToolIndex(0);
-                    }}
-                    className="w-full pl-9 pr-3.5 py-1.5 bg-slate-950/40 focus:bg-slate-950/85 text-[11px] border border-slate-800/85 focus:border-cyan-500/60 rounded-lg outline-none placeholder:text-slate-500 text-slate-200"
-                  />
-                </div>
-
-                <div className="flex flex-col gap-1.5 overflow-y-auto flex-1 pr-1 font-mono text-[11px]">
-                  {log.tools
-                    .map((tool, index) => ({ tool, index }))
-                    .filter(({ tool }) =>
-                      tool.name
-                        .toLowerCase()
-                        .includes(toolSearchQuery.toLowerCase()),
-                    )
-                    .map(({ tool, index }) => {
-                      const isSelected = selectedToolIndex === index;
-                      return (
-                        <button
-                          key={index}
-                          onClick={() => setSelectedToolIndex(index)}
-                          className={`text-left px-3 py-2 rounded-lg transition-all truncate border shrink-0 ${
-                            isSelected
-                              ? "bg-cyan-950/25 border-cyan-500/50 text-cyan-400 font-bold"
-                              : "bg-transparent border-transparent text-slate-400 hover:text-slate-200 hover:bg-slate-900/30"
-                          }`}
-                          title={tool.name}
-                        >
-                          🔧 {tool.name}
-                        </button>
-                      );
-                    })}
-                  {log.tools.filter((t) =>
-                    t.name
-                      .toLowerCase()
-                      .includes(toolSearchQuery.toLowerCase()),
-                  ).length === 0 && (
-                    <div className="text-center text-slate-500 py-6 text-[10px]">
-                      未找到相关工具
-                    </div>
-                  )}
-                </div>
+        {activeTab === "tools" && log.tools && log.tools.length > 0 && (
+          <div className="flex flex-col lg:flex-row gap-5 flex-1 min-h-0 h-full overflow-hidden">
+            <div className="w-full lg:w-[240px] flex flex-col gap-3 shrink-0 bg-slate-950/20 border border-slate-900/40 p-3.5 rounded-2xl min-h-0 overflow-y-auto">
+              <div className="relative flex items-center">
+                <span className="absolute left-3.5 text-slate-500">
+                  <IconSearch />
+                </span>
+                <input
+                  type="text"
+                  placeholder="搜索工具名..."
+                  value={toolSearchQuery}
+                  onChange={(e) => {
+                    setToolSearchQuery(e.target.value);
+                    setSelectedToolIndex(0);
+                  }}
+                  className="w-full pl-9 pr-3.5 py-1.5 bg-slate-950/40 focus:bg-slate-950/85 text-[11px] border border-slate-800/85 focus:border-cyan-500/60 rounded-lg outline-none placeholder:text-slate-500 text-slate-200"
+                />
               </div>
 
-              {(() => {
-                const selectedTool =
-                  log.tools[selectedToolIndex] || log.tools[0];
-                if (!selectedTool) return null;
-                return (
-                  <div className="flex-1 flex flex-col gap-3 min-w-0 overflow-y-auto">
-                    <div className="p-4 bg-slate-950/20 border border-slate-900 rounded-xl flex flex-col gap-2.5">
-                      <div className="flex items-center gap-2">
-                        <span className="text-[10px] font-bold px-2 py-0.5 bg-cyan-950/80 border border-cyan-900/20 text-cyan-400 rounded-md">
-                          TOOL
-                        </span>
-                        <span className="text-sm font-bold text-slate-200 font-mono">
-                          {selectedTool.name}
-                        </span>
-                      </div>
-                      {selectedTool.description && (
-                        <p className="text-xs text-slate-400 leading-relaxed bg-slate-950/45 p-3 rounded-lg border border-slate-900/60">
-                          <span className="font-semibold text-slate-400 block mb-1">
-                            功能描述：
-                          </span>
-                          {selectedTool.description}
-                        </p>
-                      )}
-                    </div>
-                    <div className="flex flex-col shrink-0">
-                      <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider block mb-1">
-                        Parameters Schema
-                      </span>
-                      <CodeBlock
-                        code={formatJSON(selectedTool.parameters)}
-                        language="parameters.schema.json"
-                      />
-                    </div>
+              <div className="flex flex-col gap-1.5 overflow-y-auto flex-1 pr-1 font-mono text-[11px]">
+                {log.tools
+                  .map((tool, index) => ({ tool, index }))
+                  .filter(({ tool }) =>
+                    tool.name
+                      .toLowerCase()
+                      .includes(toolSearchQuery.toLowerCase()),
+                  )
+                  .map(({ tool, index }) => {
+                    const isSelected = selectedToolIndex === index;
+                    return (
+                      <button
+                        key={index}
+                        onClick={() => setSelectedToolIndex(index)}
+                        className={`text-left px-3 py-2 rounded-lg transition-all truncate border shrink-0 ${
+                          isSelected
+                            ? "bg-cyan-950/25 border-cyan-500/50 text-cyan-400 font-bold"
+                            : "bg-transparent border-transparent text-slate-400 hover:text-slate-200 hover:bg-slate-900/30"
+                        }`}
+                        title={tool.name}
+                      >
+                        🔧 {tool.name}
+                      </button>
+                    );
+                  })}
+                {log.tools.filter((t) =>
+                  t.name.toLowerCase().includes(toolSearchQuery.toLowerCase()),
+                ).length === 0 && (
+                  <div className="text-center text-slate-500 py-6 text-[10px]">
+                    未找到相关工具
                   </div>
-                );
-              })()}
+                )}
+              </div>
             </div>
-          )}
+
+            {(() => {
+              const selectedTool = log.tools[selectedToolIndex] || log.tools[0];
+              if (!selectedTool) return null;
+              return (
+                <div className="flex-1 flex flex-col gap-3 min-w-0 overflow-y-auto">
+                  <div className="p-4 bg-slate-950/20 border border-slate-900 rounded-xl flex flex-col gap-2.5">
+                    <div className="flex items-center gap-2">
+                      <span className="text-[10px] font-bold px-2 py-0.5 bg-cyan-950/80 border border-cyan-900/20 text-cyan-400 rounded-md">
+                        TOOL
+                      </span>
+                      <span className="text-sm font-bold text-slate-200 font-mono">
+                        {selectedTool.name}
+                      </span>
+                    </div>
+                    {selectedTool.description && (
+                      <p className="text-xs text-slate-400 leading-relaxed bg-slate-950/45 p-3 rounded-lg border border-slate-900/60">
+                        <span className="font-semibold text-slate-400 block mb-1">
+                          功能描述：
+                        </span>
+                        {selectedTool.description}
+                      </p>
+                    )}
+                  </div>
+                  <div className="flex flex-col shrink-0">
+                    <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider block mb-1">
+                      Parameters Schema
+                    </span>
+                    <CodeBlock
+                      code={formatJSON(selectedTool.parameters)}
+                      language="parameters.schema.json"
+                    />
+                  </div>
+                </div>
+              );
+            })()}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -2063,7 +2072,7 @@ export default function App() {
               className="text-[9px] text-slate-400/80 code-font group-hover:hidden"
               title={log.createdAt || ""}
             >
-              {log.createdAt ? log.createdAt.split(" ")[1] : ""}
+              {formatLogDateTime(log.createdAt)}
             </span>
             <button
               title="删除请求"
